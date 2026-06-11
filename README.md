@@ -3,6 +3,30 @@
 A Pine Script v6 TradingView indicator implementing **7 Opening Range Breakout (ORB) models** for the New York session, plus a **Combined confidence-scoring mode**. Built for discretionary and systematic traders who want multi-model confluence on ORB setups.
 
 > **New:** [`ORB_Pro_Indicator.pine`](ORB_Pro_Indicator.pine) — a separate, research-based single-strategy ORB indicator. See [ORB Pro](#orb-pro--research-based-orb) below.
+> **New:** [`XAU_Pro_Indicator.pine`](XAU_Pro_Indicator.pine) — a Gold-specialized session-breakout indicator. See [XAU Pro](#xau-pro--gold-session-breakout) below.
+
+---
+
+## XAU Pro — Gold Session Breakout
+
+`XAU_Pro_Indicator.pine` is purpose-built for **XAUUSD / Gold** — not a generic ORB with gold defaults, but a design driven by how gold actually trades:
+
+**Two gold-native setups:**
+
+- **Setup A — Asian Range Breakout.** Gold consolidates during the Asian session and breaks out when London/NY liquidity arrives — a classic documented gold pattern with typical targets of 1.5–2× the Asian range width. The range builds 19:00–02:00 NY; entries are allowed only during the London → NY-overlap trade window (03:00–11:30 NY). Days where the Asian range is already wide (> 2× ATR) are skipped — the move already happened overnight.
+- **Setup B — NY Opening Range Breakout.** COMEX open + US data flow make 8:00–11:30 NY gold's most directional window. Opening-candle direction rule per Zarattini & Aziz (2023). OR start selectable: 9:30 (equity open) or 8:20 (COMEX open).
+
+**Gold-specific machinery:**
+
+- **DXY inverse-correlation filter** read on a 60-min timeframe (where the correlation is stable — minute-level DXY is noise). Scored 25/100 by default; optional hard gate.
+- **News-spike guard** — after any bar with range ≥ 3× ATR (8:30 CPI/NFP candles, flash moves), new entries are blocked for a cooldown period. Gold spreads widen up to 3× during news and first reactions frequently reverse; the guard refuses to chase.
+- **Window relative volume** — session-window tick volume vs that window's own 14-day average ("in play" filter, softened for tick-volume proxy).
+- **Stop floor** — risk is never tighter than 0.5× ATR, so normal gold spread noise can't tag the stop; risk capped at 1.5× ATR.
+- **Flat before 17:00 NY** — gold liquidity dies into the daily rollover and spreads spike; default EOD flat at 16:45.
+
+Plus the same honest accounting as ORB Pro: same-bar TP+SL counts as a loss, cumulative net R per setup, daily halt after N losses, non-repainting HTF/DXY data, and machine-parseable webhook alerts (`XAUPRO|setup|side|ticker|entry|sl|tp|score|dxy`). Warns if loaded on a non-Gold chart.
+
+**Run it on XAUUSD, 5-min chart.** Forward-test and watch Net R before risking money — tick volume and 24h sessions make gold less forgiving than the instruments where breakout edges were academically documented.
 
 ---
 

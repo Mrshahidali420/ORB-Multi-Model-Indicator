@@ -1,0 +1,667 @@
+// ============================================================
+// XAU Pro — Gold Session Breakout  (Pine v6)
+// ============================================================
+// Purpose-built for XAUUSD / Gold. NOT a generic ORB — every gate
+// here exists because of how gold specifically trades:
+//
+//  SETUP A — ASIAN RANGE BREAKOUT
+//   Gold consolidates during the Asian session (low volatility,
+//   position building) and breaks out when London/NY liquidity
+//   arrives. Classic documented gold pattern; typical targets run
+//   1.5–2.0× the Asian range width.
+//
+//  SETUP B — NY OPENING RANGE BREAKOUT
+//   COMEX open + US data flow make 8:00–11:30 NY the most
+//   directional window of the gold day. Opening-candle direction
+//   rule per Zarattini & Aziz (2023).
+//
+//  GOLD-SPECIFIC MACHINERY
+//   • DXY inverse-correlation filter — read on a HIGHER timeframe
+//     (60m default) where the correlation is stable; scored 25 pts,
+//     optional hard gate.
+//   • News-spike guard — gold's 8:30 ET data candles are violent
+//     and spreads widen up to 3×. After any bar ≥ 3× ATR, entries
+//     are blocked for a cooldown period instead of chasing.
+//   • Tick-volume RVOL — window volume vs the same window's own
+//     14-day average ("in play" filter). Tick volume is a proxy on
+//     spot gold but correlates with real activity.
+//   • Stop floor — never tighter than 0.5× ATR so normal gold
+//     spread noise can't tag the stop.
+//
+//  HONEST ACCOUNTING
+//   Same-bar TP+SL counts as a LOSS. Cumulative net R tracked.
+//   EOD flat at a set NY time. Daily halt after N losses.
+//   Non-repainting: HTF/DXY data via expr[1] + lookahead_on.
+//
+// Recommended: XAUUSD (or GOLD/GC) on a 5-min chart.
+// ============================================================
+//@version=6
+indicator("XAU Pro — Gold Session Breakout", shorttitle="XAU-PRO", overlay=true,
+     max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================================================
+// SECTION 1 — INPUTS
+// ============================================================
+
+// ── Setup A: Asian Range Breakout ─────────────────────────────
+i_aOn       = input.bool(true, "Enable Asian Range Breakout", group="Setup A — Asian Range")
+i_aSess     = input.session("1900-0200", "Asian Accumulation Window (NY time)", group="Setup A — Asian Range",
+     tooltip="Range built during this window (≈ 00:00–07:00 GMT). Breakouts are traded later, in the trade window below.")
+i_aTradeSess = input.session("0300-1130", "Breakout Trade Window (NY time)", group="Setup A — Asian Range",
+     tooltip="Entries allowed only inside this window — London session through the London/NY overlap. The 8:00–11:30 NY overlap scores highest.")
+i_aTgtMode  = input.string("R Multiple", "Target Mode", options=["R Multiple", "1.5× Range Width"], group="Setup A — Asian Range",
+     tooltip="1.5× Range Width = the documented gold playbook (breakouts typically run 1.5–2× the Asian range). R Multiple uses the shared R:R below.")
+i_aMaxRange = input.float(2.0, "Skip If Asian Range > × ATR14", minval=0.5, maxval=5.0, step=0.25, group="Setup A — Asian Range",
+     tooltip="A huge Asian range means the move already happened overnight — breakout quality drops. Skip those days.")
+
+// ── Setup B: NY Opening Range ─────────────────────────────────
+i_bOn      = input.bool(true, "Enable NY Opening Range Breakout", group="Setup B — NY ORB")
+i_bStart   = input.string("0930", "OR Start (NY)", options=["0820", "0930"], group="Setup B — NY ORB",
+     tooltip="0930 = equity open (classic ORB). 0820 = COMEX futures open — earlier but overlaps the 8:30 data window; keep the news guard ON if you use it.")
+i_bMins    = input.int(15, "OR Length (min)", minval=5, maxval=30, step=5, group="Setup B — NY ORB")
+i_bDirFilt = input.bool(true, "Opening-Candle Direction Filter", group="Setup B — NY ORB",
+     tooltip="Trade only in the direction the opening range candle closed (Zarattini & Aziz 2023 rule).")
+i_bCutoff  = input.int(12, "No New B Entries After (NY hour)", minval=10, maxval=15, group="Setup B — NY ORB")
+
+// ── Gold Filters ──────────────────────────────────────────────
+i_dxySym   = input.string("TVC:DXY", "DXY Symbol", group="Gold Filters")
+i_dxyTF    = input.timeframe("60", "DXY Trend Timeframe", group="Gold Filters",
+     tooltip="DXY/gold inverse correlation is only stable on higher TFs. 60m default; do not go below 30m.")
+i_dxyHard  = input.bool(false, "DXY Hard Gate", group="Gold Filters",
+     tooltip="OFF: DXY contributes 25 pts to the score (recommended). ON: signals against the DXY trend are blocked entirely.")
+i_newsGuard = input.bool(true, "News-Spike Guard", group="Gold Filters", inline="ng",
+     tooltip="After any bar with range ≥ 3× ATR14 (8:30 data candles, flash moves), block new entries for the cooldown — never chase a gold news spike.")
+i_newsCool  = input.int(6, "cooldown bars", minval=2, maxval=30, group="Gold Filters", inline="ng")
+i_minRVOL  = input.float(1.2, "Min Window RVOL (vs 14-day avg, 0 = off)", minval=0.0, step=0.1, group="Gold Filters",
+     tooltip="Window tick-volume vs the same window's 14-day average. Tick volume is a proxy on spot gold — threshold set softer (1.2) than the equity studies (1.5–2.0). Passes while history builds.")
+i_minScore = input.int(60, "Min Confluence Score (0–100)", minval=0, maxval=100, group="Gold Filters")
+i_maxLossDay = input.int(2, "Daily Stop: Halt After N Losses", minval=0, maxval=10, group="Gold Filters",
+     tooltip="0 = off.")
+
+// ── Risk ──────────────────────────────────────────────────────
+i_atrCap   = input.float(1.5, "Max Risk (× ATR14)", minval=0.5, maxval=4.0, step=0.25, group="Risk",
+     tooltip="Stop sits at the opposite side of the setup's range, but risk is capped at this many ATRs.")
+i_atrFloor = input.float(0.5, "Min Risk (× ATR14)", minval=0.1, maxval=1.5, step=0.1, group="Risk",
+     tooltip="Stop never tighter than this — keeps it outside normal gold spread/noise distance.")
+i_rr       = input.float(2.0, "Take-Profit (R multiple)", minval=0.5, maxval=10.0, step=0.5, group="Risk")
+i_eodExit  = input.bool(true, "Flat At", group="Risk", inline="eod",
+     tooltip="Close tracked trades at market at this NY time. Gold liquidity dies into the 17:00 NY rollover (spreads spike) — do not hold through it.")
+i_eodHour  = input.int(16, "NY hour", minval=11, maxval=16, group="Risk", inline="eod")
+i_eodMin   = input.int(45, "min", minval=0, maxval=59, group="Risk", inline="eod")
+
+// ── Context ───────────────────────────────────────────────────
+i_htfTF = input.timeframe("60", "HTF Trend Timeframe (XAU)", group="Context")
+
+// ── Visuals ───────────────────────────────────────────────────
+i_showBox  = input.bool(true, "Show Range Boxes",        group="Visuals")
+i_showSLTP = input.bool(true, "Show Entry/SL/TP Zones",  group="Visuals")
+i_showLbl  = input.bool(true, "Show Signal Labels",      group="Visuals")
+i_showDash = input.bool(true, "Show Dashboard",          group="Visuals")
+i_dashPos  = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group="Visuals")
+i_colBull  = input.color(color.new(#00E676, 0),  "Bull Color",        group="Visuals")
+i_colBear  = input.color(color.new(#FF1744, 0),  "Bear Color",        group="Visuals")
+i_colAsian = input.color(color.new(#9C27B0, 80), "Asian Range Fill",  group="Visuals")
+i_colOR    = input.color(color.new(#FFD600, 85), "NY OR Fill",        group="Visuals")
+
+// ============================================================
+// SECTION 2 — HELPERS
+// ============================================================
+
+string NY_TZ = "America/New_York"
+
+f_endStr(startHHMM, durMins) =>
+    startH = math.floor(str.tonumber(startHHMM) / 100)
+    startM = str.tonumber(startHHMM) - startH * 100
+    totalMins = int(startH * 60 + startM + durMins)
+    endH = int(totalMins / 60)
+    endM = totalMins - endH * 60
+    hStr = endH < 10 ? "0" + str.tostring(endH) : str.tostring(endH)
+    mStr = endM < 10 ? "0" + str.tostring(endM) : str.tostring(endM)
+    startHHMM + "-" + hStr + mStr
+
+bSessStr = f_endStr(i_bStart, i_bMins)
+
+f_tablePos(p) =>
+    p == "Top Right" ? position.top_right : p == "Top Left" ? position.top_left :
+     p == "Bottom Right" ? position.bottom_right : position.bottom_left
+
+// ============================================================
+// SECTION 3 — DATA (non-repainting)
+// ============================================================
+
+atr14   = ta.atr(14)
+vwapVal = ta.vwap(hlc3)
+
+// Confirmed-bar idiom: expr[1] + lookahead_on = last COMPLETED higher-TF bar,
+// identical on historical and realtime bars (no repaint).
+htfClose = request.security(syminfo.tickerid, i_htfTF, close[1],             lookahead=barmerge.lookahead_on)
+htfEma20 = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, 20)[1], lookahead=barmerge.lookahead_on)
+htfEma50 = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+
+dxyClose = request.security(i_dxySym, i_dxyTF, close[1],             lookahead=barmerge.lookahead_on)
+dxyEma20 = request.security(i_dxySym, i_dxyTF, ta.ema(close, 20)[1], lookahead=barmerge.lookahead_on)
+dxyEma50 = request.security(i_dxySym, i_dxyTF, ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+
+// DXY state: -1 = DXY bearish (gold-positive), +1 = DXY bullish (gold-negative), 0 = unknown/mixed
+_dxyState = na(dxyClose) or na(dxyEma20) ? 0 : dxyClose < dxyEma20 ? -1 : dxyClose > dxyEma20 ? 1 : 0
+
+// Hard gates (pass-through when disabled or data unavailable)
+_dxyGateLong  = not i_dxyHard or _dxyState <= 0
+_dxyGateShort = not i_dxyHard or _dxyState >= 0
+
+// ============================================================
+// SECTION 4 — STATE
+// ============================================================
+
+var int _lastDay = 0
+
+// Setup A — Asian range
+var float _aH      = na
+var float _aL      = na
+var bool  _aDone   = false
+var float _aVol    = 0.0
+var float _aRVOL   = na
+var bool  _aFiredL = false
+var bool  _aFiredS = false
+var float[] _aVolHist = array.new<float>()
+
+// Setup B — NY opening range
+var float _bH      = na
+var float _bL      = na
+var bool  _bDone   = false
+var float _bOpen   = na
+var float _bClose  = na
+var int   _bDir    = 0
+var float _bVol    = 0.0
+var float _bRVOL   = na
+var bool  _bFiredL = false
+var bool  _bFiredS = false
+var float[] _bVolHist = array.new<float>()
+
+// News-spike guard
+var int _blockUntilBar = 0
+
+// Daily risk stop
+var int _lossesToday = 0
+
+// Last signal snapshot (alerts + dashboard)
+var float  _lastEntry = na
+var float  _lastSL    = na
+var float  _lastTP    = na
+var int    _lastDir   = 0
+var string _lastSetup = "-"
+var int    _lastScore = 0
+
+// Trade tracking (parallel arrays); setup: 0 = Asian, 1 = NY ORB
+var float[] _tEntry  = array.new<float>()
+var float[] _tSL     = array.new<float>()
+var float[] _tTP     = array.new<float>()
+var int[]   _tDir    = array.new<int>()
+var int[]   _tBar    = array.new<int>()
+var int[]   _tStatus = array.new<int>()    // 0 open, 1 TP, -1 SL, 2 EOD
+var int[]   _tSetup  = array.new<int>()
+
+// Cumulative stats per setup [Asian, NY]
+var int[]   _wins   = array.new<int>(2, 0)
+var int[]   _losses = array.new<int>(2, 0)
+var float   _netR   = 0.0
+
+// Visuals
+var box[]   _boxes  = array.new<box>()
+var line[]  _lines  = array.new<line>()
+var label[] _labels = array.new<label>()
+var box  _aBox = na
+var box  _bBox = na
+var table _dash = na
+var table _warn = na
+
+// ============================================================
+// SECTION 5 — SESSIONS & RESETS
+// ============================================================
+
+inAsian   = not na(time(timeframe.period, i_aSess,      NY_TZ))
+inATrade  = not na(time(timeframe.period, i_aTradeSess, NY_TZ))
+inBWindow = not na(time(timeframe.period, bSessStr,     NY_TZ))
+nyHour    = hour(time,   NY_TZ)
+nyMin     = minute(time, NY_TZ)
+
+currentDay = year(time, NY_TZ) * 10000 + month(time, NY_TZ) * 100 + dayofmonth(time, NY_TZ)
+_newDay = currentDay != _lastDay
+if _newDay
+    _lastDay := currentDay
+    _lossesToday := 0
+    // Setup B resets on the NY calendar day (its window never crosses midnight)
+    _bH      := na
+    _bL      := na
+    _bDone   := false
+    _bOpen   := na
+    _bClose  := na
+    _bDir    := 0
+    _bVol    := 0.0
+    _bRVOL   := na
+    _bFiredL := false
+    _bFiredS := false
+    _bBox    := na
+
+// Setup A resets at the START of each Asian window (the window crosses midnight,
+// so a calendar-day reset would wipe the range mid-build)
+_aSessStart = inAsian and not inAsian[1]
+if _aSessStart
+    _aH      := na
+    _aL      := na
+    _aDone   := false
+    _aVol    := 0.0
+    _aRVOL   := na
+    _aFiredL := false
+    _aFiredS := false
+    _aBox    := na
+
+// ============================================================
+// SECTION 6 — RANGE BUILDING
+// ============================================================
+
+// ── Asian range ──
+if inAsian
+    _aH   := na(_aH) ? high : math.max(_aH, high)
+    _aL   := na(_aL) ? low  : math.min(_aL, low)
+    _aVol += nz(volume)
+else if not _aDone and not na(_aH) and inAsian[1]
+    _aDone := true
+    histAvgA = array.size(_aVolHist) > 0 ? array.avg(_aVolHist) : na
+    _aRVOL  := not na(histAvgA) and histAvgA > 0 and _aVol > 0 ? _aVol / histAvgA : na
+    if _aVol > 0
+        array.push(_aVolHist, _aVol)
+        if array.size(_aVolHist) > 14
+            array.shift(_aVolHist)
+    if i_showBox
+        _aBox := box.new(bar_index, _aH, bar_index, _aL, bgcolor=i_colAsian,
+             border_color=color.new(#9C27B0, 30), border_width=1)
+        array.push(_boxes, _aBox)
+        array.push(_labels, label.new(bar_index, _aH, "ASIA H " + str.tostring(_aH, format.mintick),
+             color=color.new(#9C27B0, 20), style=label.style_label_left, textcolor=color.white, size=size.tiny))
+        array.push(_labels, label.new(bar_index, _aL, "ASIA L " + str.tostring(_aL, format.mintick),
+             color=color.new(#9C27B0, 20), style=label.style_label_left, textcolor=color.white, size=size.tiny))
+
+if _aDone and not na(_aBox) and inATrade
+    box.set_right(_aBox, bar_index)
+
+// ── NY opening range ──
+if inBWindow
+    _bH   := na(_bH) ? high : math.max(_bH, high)
+    _bL   := na(_bL) ? low  : math.min(_bL, low)
+    if na(_bOpen)
+        _bOpen := open
+    _bClose := close
+    _bVol   += nz(volume)
+else if not _bDone and not na(_bH) and inBWindow[1]
+    _bDone := true
+    _bDir  := _bClose > _bOpen ? 1 : _bClose < _bOpen ? -1 : 0
+    histAvgB = array.size(_bVolHist) > 0 ? array.avg(_bVolHist) : na
+    _bRVOL  := not na(histAvgB) and histAvgB > 0 and _bVol > 0 ? _bVol / histAvgB : na
+    if _bVol > 0
+        array.push(_bVolHist, _bVol)
+        if array.size(_bVolHist) > 14
+            array.shift(_bVolHist)
+    if i_showBox
+        _bBox := box.new(bar_index, _bH, bar_index, _bL, bgcolor=i_colOR,
+             border_color=color.new(#FFD600, 30), border_width=1)
+        array.push(_boxes, _bBox)
+        _bDirTxt = _bDir == 1 ? " ▲" : _bDir == -1 ? " ▼" : " —"
+        array.push(_labels, label.new(bar_index, _bH, "OR H " + str.tostring(_bH, format.mintick) + _bDirTxt,
+             color=color.new(#F9A825, 0), style=label.style_label_left, textcolor=color.white, size=size.tiny))
+
+if _bDone and not na(_bBox) and nyHour < i_bCutoff
+    box.set_right(_bBox, bar_index)
+
+// ============================================================
+// SECTION 7 — NEWS-SPIKE GUARD
+// A bar with range ≥ 3× ATR is a data candle or flash move. Spreads
+// widen and the first reaction frequently reverses — stand aside.
+// ============================================================
+
+_spikeBar = i_newsGuard and not na(atr14) and atr14 > 0 and (high - low) >= 3.0 * atr14
+if _spikeBar
+    _blockUntilBar := bar_index + i_newsCool
+_newsOK = not i_newsGuard or bar_index >= _blockUntilBar
+
+// ============================================================
+// SECTION 8 — CONFLUENCE SCORE
+// DXY 25 | RVOL 20 | VWAP 15 | HTF trend 15 | Prime time 10 | Range quality 10 | Direction 5
+// Missing data scores neutral — it must never silently kill signals.
+// ============================================================
+
+f_score(isLong, rvolW, rngH, rngL, dirMatch) =>
+    dxyPts = _dxyState == 0 ? 12 :
+         (isLong ? _dxyState == -1 : _dxyState == 1) ?
+         (isLong ? (dxyEma20 < dxyEma50 ? 25 : 18) : (dxyEma20 > dxyEma50 ? 25 : 18)) : 0
+    rvolPts  = na(rvolW) ? 10 : rvolW >= 2.0 ? 20 : rvolW >= 1.5 ? 15 : rvolW >= 1.2 ? 10 : 0
+    vwapPts  = na(vwapVal) ? 8 : (isLong ? close > vwapVal : close < vwapVal) ? 15 : 0
+    htfPts   = isLong ?
+         (htfClose > htfEma20 and htfEma20 > htfEma50 ? 15 : htfClose > htfEma50 ? 8 : 0) :
+         (htfClose < htfEma20 and htfEma20 < htfEma50 ? 15 : htfClose < htfEma50 ? 8 : 0)
+    primePts = nyHour >= 8 and nyHour < 12 ? 10 : nyHour >= 3 and nyHour < 8 ? 5 : 0
+    wRatio   = na(atr14) or atr14 == 0 or na(rngH) or na(rngL) ? na : (rngH - rngL) / atr14
+    widthPts = na(wRatio) ? 5 : wRatio >= 0.5 and wRatio <= 2.0 ? 10 : wRatio <= 3.0 ? 5 : 0
+    dirPts   = dirMatch ? 5 : 0
+    dxyPts + rvolPts + vwapPts + htfPts + primePts + widthPts + dirPts
+
+scoreAL = _aDone ? f_score(true,  _aRVOL, _aH, _aL, true)        : 0
+scoreAS = _aDone ? f_score(false, _aRVOL, _aH, _aL, true)        : 0
+scoreBL = _bDone ? f_score(true,  _bRVOL, _bH, _bL, _bDir == 1)  : 0
+scoreBS = _bDone ? f_score(false, _bRVOL, _bH, _bL, _bDir == -1) : 0
+
+// ============================================================
+// SECTION 9 — SIGNALS
+// ============================================================
+
+bool sigAL  = false
+bool sigAS  = false
+bool sigBL  = false
+bool sigBS  = false
+bool sigEOD = false
+
+_lossOK  = i_maxLossDay <= 0 or _lossesToday < i_maxLossDay
+
+// Risk helper: range-based stop, capped and floored by ATR
+f_risk(rawRisk) =>
+    r = rawRisk
+    if not na(atr14)
+        if r > i_atrCap * atr14
+            r := i_atrCap * atr14
+        if r < i_atrFloor * atr14
+            r := i_atrFloor * atr14
+    if na(r) or r <= 0
+        r := nz(atr14, close * 0.001)
+    r
+
+f_registerTrade(entryP, slP, tpP, dir, setup) =>
+    array.push(_tEntry,  entryP)
+    array.push(_tSL,     slP)
+    array.push(_tTP,     tpP)
+    array.push(_tDir,    dir)
+    array.push(_tBar,    bar_index)
+    array.push(_tStatus, 0)
+    array.push(_tSetup,  setup)
+
+f_drawTrade(entryP, slP, tpP, isLong, scoreV, nameTxt) =>
+    if i_showSLTP
+        array.push(_boxes, box.new(bar_index, tpP, bar_index + 20, entryP,
+             bgcolor=color.new(i_colBull, 85), border_color=color.new(i_colBull, 40)))
+        array.push(_boxes, box.new(bar_index, entryP, bar_index + 20, slP,
+             bgcolor=color.new(i_colBear, 85), border_color=color.new(i_colBear, 40)))
+        array.push(_lines, line.new(bar_index, entryP, bar_index + 20, entryP, color=color.white, width=2))
+    if i_showLbl
+        yOff = isLong ? low - nz(atr14) : high + nz(atr14)
+        array.push(_labels, label.new(bar_index, yOff,
+             text = nameTxt + (isLong ? " LONG" : " SHORT") +
+                    "\nEntry " + str.tostring(entryP, format.mintick) +
+                    "\nSL "    + str.tostring(slP,    format.mintick) +
+                    "\nTP "    + str.tostring(tpP,    format.mintick) +
+                    "\nScore " + str.tostring(scoreV),
+             color = isLong ? i_colBull : i_colBear,
+             style = isLong ? label.style_label_up : label.style_label_down,
+             textcolor = color.white, size = size.small))
+
+// ── Setup A: Asian range breakout (London → NY overlap) ──────
+_aRangeOK = _aDone and not na(_aH) and not na(_aL) and not na(atr14) and (_aH - _aL) <= i_aMaxRange * atr14
+_aRvolOK  = i_minRVOL <= 0 or na(_aRVOL) or _aRVOL >= i_minRVOL
+
+if i_aOn and _aRangeOK and inATrade and _newsOK and _lossOK
+    aRange = _aH - _aL
+    if not _aFiredL and _dxyGateLong and _aRvolOK and scoreAL >= i_minScore
+        if close > _aH and close[1] <= _aH
+            entryP = close
+            risk   = f_risk(entryP - _aL)
+            slP    = entryP - risk
+            tpP    = i_aTgtMode == "1.5× Range Width" ? entryP + aRange * 1.5 : entryP + risk * i_rr
+            sigAL      := true
+            _aFiredL   := true
+            _lastEntry := entryP
+            _lastSL    := slP
+            _lastTP    := tpP
+            _lastDir   := 1
+            _lastSetup := "ASIA"
+            _lastScore := scoreAL
+            f_registerTrade(entryP, slP, tpP, 1, 0)
+            f_drawTrade(entryP, slP, tpP, true, scoreAL, "ASIA BREAK")
+    if not _aFiredS and _dxyGateShort and _aRvolOK and scoreAS >= i_minScore
+        if close < _aL and close[1] >= _aL
+            entryP = close
+            risk   = f_risk(_aH - entryP)
+            slP    = entryP + risk
+            tpP    = i_aTgtMode == "1.5× Range Width" ? entryP - aRange * 1.5 : entryP - risk * i_rr
+            sigAS      := true
+            _aFiredS   := true
+            _lastEntry := entryP
+            _lastSL    := slP
+            _lastTP    := tpP
+            _lastDir   := -1
+            _lastSetup := "ASIA"
+            _lastScore := scoreAS
+            f_registerTrade(entryP, slP, tpP, -1, 0)
+            f_drawTrade(entryP, slP, tpP, false, scoreAS, "ASIA BREAK")
+
+// ── Setup B: NY opening range breakout ───────────────────────
+_bRvolOK = i_minRVOL <= 0 or na(_bRVOL) or _bRVOL >= i_minRVOL
+_bTimeOK = _bDone and nyHour < i_bCutoff
+
+if i_bOn and _bTimeOK and not na(_bH) and not na(_bL) and _newsOK and _lossOK
+    _bDirOKL = not i_bDirFilt or _bDir == 1
+    _bDirOKS = not i_bDirFilt or _bDir == -1
+    if not _bFiredL and _bDirOKL and _dxyGateLong and _bRvolOK and scoreBL >= i_minScore
+        if close > _bH and close[1] <= _bH
+            entryP = close
+            risk   = f_risk(entryP - _bL)
+            slP    = entryP - risk
+            tpP    = entryP + risk * i_rr
+            sigBL      := true
+            _bFiredL   := true
+            _lastEntry := entryP
+            _lastSL    := slP
+            _lastTP    := tpP
+            _lastDir   := 1
+            _lastSetup := "NY-ORB"
+            _lastScore := scoreBL
+            f_registerTrade(entryP, slP, tpP, 1, 1)
+            f_drawTrade(entryP, slP, tpP, true, scoreBL, "NY ORB")
+    if not _bFiredS and _bDirOKS and _dxyGateShort and _bRvolOK and scoreBS >= i_minScore
+        if close < _bL and close[1] >= _bL
+            entryP = close
+            risk   = f_risk(_bH - entryP)
+            slP    = entryP + risk
+            tpP    = entryP - risk * i_rr
+            sigBS      := true
+            _bFiredS   := true
+            _lastEntry := entryP
+            _lastSL    := slP
+            _lastTP    := tpP
+            _lastDir   := -1
+            _lastSetup := "NY-ORB"
+            _lastScore := scoreBS
+            f_registerTrade(entryP, slP, tpP, -1, 1)
+            f_drawTrade(entryP, slP, tpP, false, scoreBS, "NY ORB")
+
+// ============================================================
+// SECTION 10 — TRADE RESOLUTION (honest accounting)
+// Same-bar TP+SL → LOSS. EOD flat at market. Never resolves on entry bar.
+// ============================================================
+
+_eodNow = i_eodExit and (nyHour > i_eodHour or (nyHour == i_eodHour and nyMin >= i_eodMin))
+
+trN = array.size(_tStatus)
+if trN > 0
+    for _i = 0 to trN - 1
+        if array.get(_tStatus, _i) == 0 and bar_index > array.get(_tBar, _i)
+            _e   = array.get(_tEntry, _i)
+            _sl  = array.get(_tSL,    _i)
+            _tp  = array.get(_tTP,    _i)
+            _d   = array.get(_tDir,   _i)
+            _st  = array.get(_tSetup, _i)
+            _rsk = math.abs(_e - _sl)
+            _tpHit = _d == 1 ? high >= _tp : low  <= _tp
+            _slHit = _d == 1 ? low  <= _sl : high >= _sl
+            if _slHit
+                array.set(_tStatus, _i, -1)
+                array.set(_losses, _st, array.get(_losses, _st) + 1)
+                _lossesToday += 1
+                _netR        -= 1.0
+            else if _tpHit
+                array.set(_tStatus, _i, 1)
+                array.set(_wins, _st, array.get(_wins, _st) + 1)
+                _netR += _rsk > 0 ? math.abs(_tp - _e) / _rsk : i_rr
+            else if _eodNow
+                array.set(_tStatus, _i, 2)
+                _r = _rsk > 0 ? (close - _e) * _d / _rsk : 0.0
+                _netR += _r
+                if _r >= 0
+                    array.set(_wins, _st, array.get(_wins, _st) + 1)
+                else
+                    array.set(_losses, _st, array.get(_losses, _st) + 1)
+                    _lossesToday += 1
+                sigEOD := true
+                if i_showLbl
+                    array.push(_labels, label.new(bar_index, close,
+                         "EOD " + (_r >= 0 ? "+" : "") + str.tostring(_r, "#.##") + "R",
+                         color=color.new(#607D8B, 20), style=label.style_label_left,
+                         textcolor=color.white, size=size.tiny))
+
+// Trim history + object cleanup
+while array.size(_tEntry) > 300
+    array.shift(_tEntry)
+    array.shift(_tSL)
+    array.shift(_tTP)
+    array.shift(_tDir)
+    array.shift(_tBar)
+    array.shift(_tStatus)
+    array.shift(_tSetup)
+while array.size(_boxes) > 480
+    box.delete(array.shift(_boxes))
+while array.size(_lines) > 480
+    line.delete(array.shift(_lines))
+while array.size(_labels) > 480
+    label.delete(array.shift(_labels))
+
+// ============================================================
+// SECTION 11 — DASHBOARD
+// ============================================================
+
+if i_showDash
+    if na(_dash)
+        _dash := table.new(f_tablePos(i_dashPos), 2, 11,
+             bgcolor=color.new(#1A1D26, 10), border_color=color.new(color.gray, 60),
+             border_width=1, frame_color=color.new(color.gray, 30), frame_width=1)
+
+    _dim = color.new(#90CAF9, 0)
+    _bgN = color.new(#1A1D26, 10)
+
+    table.cell(_dash, 0, 0, "XAU PRO", text_color=color.white, bgcolor=color.new(#B8860B, 0), text_size=size.small)
+    _gStatus = not _newsOK ? "⛔ NEWS COOLDOWN" : not _lossOK ? "HALTED (daily stop)" :
+         nyHour >= 8 and nyHour < 12 ? "★ PRIME WINDOW" : "monitoring"
+    table.cell(_dash, 1, 0, _gStatus, text_color=not _newsOK ? color.new(#FF6E6E, 0) : color.new(#FFD54F, 0),
+         bgcolor=color.new(#B8860B, 0), text_size=size.small)
+
+    _aStat = not i_aOn ? "off" : not _aDone ? "building…" :
+         not _aRangeOK ? "skipped (range too wide)" :
+         _aFiredL ? "LONG fired" : _aFiredS ? "SHORT fired" :
+         inATrade ? "ARMED ▲▼" : "waiting for window"
+    table.cell(_dash, 0, 1, "A: Asian Break", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 1, _aStat, text_color=_aFiredL ? i_colBull : _aFiredS ? i_colBear : color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    table.cell(_dash, 0, 2, "Asia H / L", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 2, na(_aH) ? "-" : str.tostring(_aH, format.mintick) + " / " + str.tostring(_aL, format.mintick),
+         text_color=color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    _bStat = not i_bOn ? "off" : not _bDone ? (inBWindow ? "building…" : "waiting 9:30") :
+         _bFiredL ? "LONG fired" : _bFiredS ? "SHORT fired" :
+         nyHour >= i_bCutoff ? "done (cutoff)" :
+         i_bDirFilt and _bDir == 0 ? "no trade (doji OR)" :
+         i_bDirFilt ? (_bDir == 1 ? "ARMED ▲ only" : "ARMED ▼ only") : "ARMED ▲▼"
+    table.cell(_dash, 0, 3, "B: NY ORB", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 3, _bStat, text_color=_bFiredL ? i_colBull : _bFiredS ? i_colBear : color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    table.cell(_dash, 0, 4, "OR H / L", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 4, na(_bH) ? "-" : str.tostring(_bH, format.mintick) + " / " + str.tostring(_bL, format.mintick),
+         text_color=color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    _dxyTxt = _dxyState == 0 ? "n/a" : _dxyState == -1 ? "▼ Bear → Gold+" : "▲ Bull → Gold−"
+    _dxyClr = _dxyState == -1 ? i_colBull : _dxyState == 1 ? i_colBear : _dim
+    table.cell(_dash, 0, 5, "DXY (" + i_dxyTF + "m)", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 5, _dxyTxt, text_color=_dxyClr, bgcolor=_bgN, text_size=size.tiny)
+
+    _rvTxt = "A " + (na(_aRVOL) ? "-" : str.tostring(_aRVOL, "#.##") + "×") + "   B " + (na(_bRVOL) ? "-" : str.tostring(_bRVOL, "#.##") + "×")
+    table.cell(_dash, 0, 6, "Window RVOL", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 6, _rvTxt, text_color=color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    _scTxt = "A ▲" + str.tostring(scoreAL) + " ▼" + str.tostring(scoreAS) + "   B ▲" + str.tostring(scoreBL) + " ▼" + str.tostring(scoreBS)
+    table.cell(_dash, 0, 7, "Scores (min " + str.tostring(i_minScore) + ")", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 7, _scTxt, text_color=color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    _lastTxt = _lastDir == 0 ? "-" : _lastSetup + (_lastDir == 1 ? " LONG " : " SHORT ") + str.tostring(_lastEntry, format.mintick)
+    table.cell(_dash, 0, 8, "Last Signal", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 8, _lastTxt, text_color=_lastDir == 1 ? i_colBull : _lastDir == -1 ? i_colBear : _dim, bgcolor=_bgN, text_size=size.tiny)
+
+    _wA = array.get(_wins, 0)
+    _lA = array.get(_losses, 0)
+    _wB = array.get(_wins, 1)
+    _lB = array.get(_losses, 1)
+    _recTxt = "A " + str.tostring(_wA) + "W/" + str.tostring(_lA) + "L   B " + str.tostring(_wB) + "W/" + str.tostring(_lB) + "L"
+    table.cell(_dash, 0, 9, "Record", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 9, _recTxt, text_color=color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    _nrClr = _netR > 0 ? i_colBull : _netR < 0 ? i_colBear : _dim
+    table.cell(_dash, 0, 10, "Net R (cumulative)", text_color=_dim, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 10, (_netR >= 0 ? "+" : "") + str.tostring(_netR, "#.##") + "R", text_color=_nrClr, bgcolor=_bgN, text_size=size.tiny)
+
+// Warnings: wrong symbol / chart TF too high
+_isGold = syminfo.basecurrency == "XAU" or str.contains(str.upper(syminfo.ticker), "XAU") or str.contains(str.upper(syminfo.ticker), "GOLD")
+_tfTooHigh = timeframe.in_seconds(timeframe.period) * 3 > i_bMins * 60
+if not _isGold or _tfTooHigh
+    if na(_warn)
+        _warn := table.new(position.top_center, 1, 1, bgcolor=color.new(#B71C1C, 10),
+             border_color=color.new(#FF8A80, 0), border_width=1)
+    _warnTxt = not _isGold ? "⚠ XAU Pro is tuned for Gold (XAUUSD/GOLD) — this chart is " + syminfo.ticker + "." :
+         "⚠ Chart TF too high for a " + str.tostring(i_bMins) + "-min opening range. Use a 1-min or 5-min chart."
+    table.cell(_warn, 0, 0, _warnTxt, text_color=color.white, text_size=size.small)
+
+// ============================================================
+// SECTION 12 — PLOTS, BACKGROUND, ALERTS
+// ============================================================
+
+plotshape(sigAL, title="Asia Break — Long",  style=shape.triangleup,   location=location.belowbar,
+     color=color.new(#9C27B0, 0), size=size.normal, text="ASIA", textcolor=color.white)
+plotshape(sigAS, title="Asia Break — Short", style=shape.triangledown, location=location.abovebar,
+     color=color.new(#9C27B0, 0), size=size.normal, text="ASIA", textcolor=color.white)
+plotshape(sigBL, title="NY ORB — Long",  style=shape.triangleup,   location=location.belowbar,
+     color=i_colBull, size=size.normal, text="NY", textcolor=color.white)
+plotshape(sigBS, title="NY ORB — Short", style=shape.triangledown, location=location.abovebar,
+     color=i_colBear, size=size.normal, text="NY", textcolor=color.white)
+
+bgcolor(inAsian ? color.new(#9C27B0, 94) : na, title="Asian Window")
+bgcolor(inBWindow ? color.new(#FFD600, 92) : na, title="NY OR Window")
+bgcolor(i_newsGuard and not _newsOK ? color.new(#B71C1C, 88) : na, title="News Cooldown")
+
+alertcondition(sigAL,           title="XAU Pro — Asia Break LONG",  message="XAUPRO ASIA LONG | {{ticker}} | {{close}}")
+alertcondition(sigAS,           title="XAU Pro — Asia Break SHORT", message="XAUPRO ASIA SHORT | {{ticker}} | {{close}}")
+alertcondition(sigBL,           title="XAU Pro — NY ORB LONG",      message="XAUPRO NYORB LONG | {{ticker}} | {{close}}")
+alertcondition(sigBS,           title="XAU Pro — NY ORB SHORT",     message="XAUPRO NYORB SHORT | {{ticker}} | {{close}}")
+alertcondition(sigAL or sigBL,  title="XAU Pro — ANY LONG",         message="XAUPRO LONG | {{ticker}} | {{close}}")
+alertcondition(sigAS or sigBS,  title="XAU Pro — ANY SHORT",        message="XAUPRO SHORT | {{ticker}} | {{close}}")
+alertcondition(sigEOD,          title="XAU Pro — EOD EXIT",         message="XAUPRO EOD EXIT | {{ticker}} | {{close}}")
+
+// Structured alert() for webhook bots:
+// XAUPRO|setup|side|ticker|entry|sl|tp|score|dxy
+_dxyTag = _dxyState == -1 ? "DXY-BEAR" : _dxyState == 1 ? "DXY-BULL" : "DXY-NA"
+if sigAL or sigBL
+    alert("XAUPRO|" + _lastSetup + "|LONG|" + syminfo.ticker + "|" + str.tostring(_lastEntry, format.mintick) + "|" +
+         str.tostring(_lastSL, format.mintick) + "|" + str.tostring(_lastTP, format.mintick) + "|" +
+         str.tostring(_lastScore) + "|" + _dxyTag, alert.freq_once_per_bar_close)
+if sigAS or sigBS
+    alert("XAUPRO|" + _lastSetup + "|SHORT|" + syminfo.ticker + "|" + str.tostring(_lastEntry, format.mintick) + "|" +
+         str.tostring(_lastSL, format.mintick) + "|" + str.tostring(_lastTP, format.mintick) + "|" +
+         str.tostring(_lastScore) + "|" + _dxyTag, alert.freq_once_per_bar_close)
+if sigEOD
+    alert("XAUPRO|EODEXIT|" + syminfo.ticker + "|" + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+// ============================================================
+// END — XAU Pro
+// ============================================================
