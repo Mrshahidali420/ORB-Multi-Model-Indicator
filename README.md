@@ -64,7 +64,7 @@ Context factors (VWAP side, HTF trend, gap alignment, OR width quality) feed a 0
 - **Non-repainting** — all higher-timeframe data uses confirmed-bar values (`expr[1]` + `lookahead_on`), so live signals match the backtest; NR7/NR4 and previous-day levels use completed days only
 - **Automatic DST handling** — NY session detection via IANA timezone (`America/New_York`)
 - **Per-model performance dashboard** — win rate, streak, score, agreement count, and BEST badge
-- **18 alert conditions** — one per model direction, Combined bull/bear, plus ANY-signal catch-alls
+- **19 alert conditions** — one per model direction, Combined bull/bear, ANY-signal catch-alls, and EOD exit
 - **Economic event markers** — CPI / NFP on Day Bias label (Gold charts)
 - **OR midline, prime-window highlight** — visual aids for the 9:30–10:00 prime window
 - **OR width filter** — optional ATR-based gate to skip low-quality ranges
@@ -108,9 +108,10 @@ Confidence factors (each weighted 0–100):
 ## Installation
 
 1. Open [TradingView](https://www.tradingview.com) and go to the **Pine Script Editor**
-2. Paste the contents of `ORB_Multi_Model_Indicator.pine`
+2. Paste the contents of `ORB_Multi_Model_Indicator.pine` (or `ORB_Pro_Indicator.pine` / `XAU_Pro_Indicator.pine`)
 3. Click **Add to chart**
 4. Configure inputs: select Mode (Multi-Model or Combined), enable the models you want, set your reference timeframes
+5. **For alerts:** create one alert on the indicator with condition **"Any alert() function call"** — this delivers the detailed dynamic messages (entry/SL/TP/score, webhook-parseable in ORB Pro and XAU Pro). The named `alertcondition` entries are also available for per-model alerts.
 
 ---
 

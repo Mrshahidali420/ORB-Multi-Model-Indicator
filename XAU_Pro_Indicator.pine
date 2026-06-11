@@ -64,7 +64,8 @@ i_bDirFilt = input.bool(true, "Opening-Candle Direction Filter", group="Setup B 
 i_bCutoff  = input.int(12, "No New B Entries After (NY hour)", minval=10, maxval=15, group="Setup B — NY ORB")
 
 // ── Gold Filters ──────────────────────────────────────────────
-i_dxySym   = input.string("TVC:DXY", "DXY Symbol", group="Gold Filters")
+i_dxySym   = input.string("TVC:DXY", "DXY Symbol", group="Gold Filters",
+     tooltip="If TVC:DXY is unavailable on your plan/data feed, try CAPITALCOM:DXY, ICEUS:DXY, or FX_IDC:USDOLLAR.")
 i_dxyTF    = input.timeframe("60", "DXY Trend Timeframe", group="Gold Filters",
      tooltip="DXY/gold inverse correlation is only stable on higher TFs. 60m default; do not go below 30m.")
 i_dxyHard  = input.bool(false, "DXY Hard Gate", group="Gold Filters",
@@ -72,6 +73,8 @@ i_dxyHard  = input.bool(false, "DXY Hard Gate", group="Gold Filters",
 i_newsGuard = input.bool(true, "News-Spike Guard", group="Gold Filters", inline="ng",
      tooltip="After any bar with range ≥ 3× ATR14 (8:30 data candles, flash moves), block new entries for the cooldown — never chase a gold news spike.")
 i_newsCool  = input.int(6, "cooldown bars", minval=2, maxval=30, group="Gold Filters", inline="ng")
+i_breakBuf = input.float(0.05, "Breakout Buffer (× ATR14)", minval=0.0, maxval=0.5, step=0.05, group="Gold Filters",
+     tooltip="Require close beyond the range level + buffer. Gold is notorious for one-tick fakeouts just past obvious levels — a small buffer (0.05–0.10 ATR) filters many of them at the cost of slightly later entries. 0 = classic breakout.")
 i_minRVOL  = input.float(1.2, "Min Window RVOL (vs 14-day avg, 0 = off)", minval=0.0, step=0.1, group="Gold Filters",
      tooltip="Window tick-volume vs the same window's 14-day average. Tick volume is a proxy on spot gold — threshold set softer (1.2) than the equity studies (1.5–2.0). Passes while history builds.")
 i_minScore = input.int(60, "Min Confluence Score (0–100)", minval=0, maxval=100, group="Gold Filters")
@@ -361,6 +364,7 @@ bool sigBS  = false
 bool sigEOD = false
 
 _lossOK  = i_maxLossDay <= 0 or _lossesToday < i_maxLossDay
+_buf     = i_breakBuf * nz(atr14)
 
 // Risk helper: range-based stop, capped and floored by ATR
 f_risk(rawRisk) =>
@@ -409,7 +413,7 @@ _aRvolOK  = i_minRVOL <= 0 or na(_aRVOL) or _aRVOL >= i_minRVOL
 if i_aOn and _aRangeOK and inATrade and _newsOK and _lossOK
     aRange = _aH - _aL
     if not _aFiredL and _dxyGateLong and _aRvolOK and scoreAL >= i_minScore
-        if close > _aH and close[1] <= _aH
+        if close > _aH + _buf and close[1] <= _aH + _buf
             entryP = close
             risk   = f_risk(entryP - _aL)
             slP    = entryP - risk
@@ -425,7 +429,7 @@ if i_aOn and _aRangeOK and inATrade and _newsOK and _lossOK
             f_registerTrade(entryP, slP, tpP, 1, 0)
             f_drawTrade(entryP, slP, tpP, true, scoreAL, "ASIA BREAK")
     if not _aFiredS and _dxyGateShort and _aRvolOK and scoreAS >= i_minScore
-        if close < _aL and close[1] >= _aL
+        if close < _aL - _buf and close[1] >= _aL - _buf
             entryP = close
             risk   = f_risk(_aH - entryP)
             slP    = entryP + risk
@@ -449,7 +453,7 @@ if i_bOn and _bTimeOK and not na(_bH) and not na(_bL) and _newsOK and _lossOK
     _bDirOKL = not i_bDirFilt or _bDir == 1
     _bDirOKS = not i_bDirFilt or _bDir == -1
     if not _bFiredL and _bDirOKL and _dxyGateLong and _bRvolOK and scoreBL >= i_minScore
-        if close > _bH and close[1] <= _bH
+        if close > _bH + _buf and close[1] <= _bH + _buf
             entryP = close
             risk   = f_risk(entryP - _bL)
             slP    = entryP - risk
@@ -465,7 +469,7 @@ if i_bOn and _bTimeOK and not na(_bH) and not na(_bL) and _newsOK and _lossOK
             f_registerTrade(entryP, slP, tpP, 1, 1)
             f_drawTrade(entryP, slP, tpP, true, scoreBL, "NY ORB")
     if not _bFiredS and _bDirOKS and _dxyGateShort and _bRvolOK and scoreBS >= i_minScore
-        if close < _bL and close[1] >= _bL
+        if close < _bL - _buf and close[1] >= _bL - _buf
             entryP = close
             risk   = f_risk(_bH - entryP)
             slP    = entryP + risk
@@ -555,7 +559,8 @@ if i_showDash
     _bgN = color.new(#1A1D26, 10)
 
     table.cell(_dash, 0, 0, "XAU PRO", text_color=color.white, bgcolor=color.new(#B8860B, 0), text_size=size.small)
-    _gStatus = not _newsOK ? "⛔ NEWS COOLDOWN" : not _lossOK ? "HALTED (daily stop)" :
+    _gStatus = not _newsOK ? "⛔ NEWS (" + str.tostring(_blockUntilBar - bar_index) + ")" :
+         not _lossOK ? "HALTED (daily stop)" :
          nyHour >= 8 and nyHour < 12 ? "★ PRIME WINDOW" : "monitoring"
     table.cell(_dash, 1, 0, _gStatus, text_color=not _newsOK ? color.new(#FF6E6E, 0) : color.new(#FFD54F, 0),
          bgcolor=color.new(#B8860B, 0), text_size=size.small)

@@ -54,6 +54,9 @@ i_minScore    = input.int(60, "Min Confluence Score (0–100)", minval=0, maxval
      tooltip="Context score must reach this before a signal fires. Components: RVOL 30, VWAP 20, opening-candle dir 15, HTF trend 15, gap 10, OR width 10.")
 i_maxLossDay  = input.int(2, "Daily Stop: Halt After N Losses", minval=0, maxval=10, group="Entry Gates",
      tooltip="No new signals for the rest of the day after this many losing resolutions today. 0 = off.")
+i_newsGuard   = input.bool(false, "News-Spike Guard", group="Entry Gates", inline="ng",
+     tooltip="After any bar with range ≥ 3× ATR14, block new entries for the cooldown.\nOFF by default for index ETFs/stocks — opening volatility IS the signal there.\nTurn ON for FX/Gold or news-heavy instruments.")
+i_newsCool    = input.int(6, "cooldown bars", minval=2, maxval=30, group="Entry Gates", inline="ng")
 
 // ── Risk ──────────────────────────────────────────────────────
 i_slMode   = input.string("Opposite OR Side", "Stop-Loss Basis", options=["Opposite OR Side", "OR Midpoint", "ATR"], group="Risk",
@@ -142,10 +145,11 @@ var float   _orVolToday = 0.0
 var float   _rvolOR     = na
 var float[] _orVolHist  = array.new<float>()
 
-// Once-per-day signal guards + daily risk stop
+// Once-per-day signal guards + daily risk stop + news-spike guard
 var bool _firedLong   = false
 var bool _firedShort  = false
 var int  _lossesToday = 0
+var int  _blockUntilBar = 0
 
 // Last signal snapshot (for alert message + dashboard)
 var float _lastEntry = na
@@ -286,10 +290,16 @@ bool sigLong  = false
 bool sigShort = false
 bool sigEOD   = false
 
+// News-spike guard: a bar with range ≥ 3× ATR is a data candle or flash move
+_spikeBar = i_newsGuard and not na(atr14) and atr14 > 0 and (high - low) >= 3.0 * atr14
+if _spikeBar
+    _blockUntilBar := bar_index + i_newsCool
+_newsOK = not i_newsGuard or bar_index >= _blockUntilBar
+
 // Hard gates shared by both directions
 _rvolOK  = i_minRVOL <= 0 or na(_rvolOR) or _rvolOR >= i_minRVOL
 _lossOK  = i_maxLossDay <= 0 or _lossesToday < i_maxLossDay
-_timeOK  = inSess and nyHour < i_cutoffHour
+_timeOK  = inSess and nyHour < i_cutoffHour and _newsOK
 _breakBuf = i_breakBufATR * nz(atr14)
 
 f_stopLong(entryP) =>
@@ -455,6 +465,7 @@ if i_showDash
     _statusTxt = not _orDone ? "BUILDING OR…" :
          _firedLong  ? "LONG FIRED" :
          _firedShort ? "SHORT FIRED" :
+         not _newsOK ? "⛔ NEWS (" + str.tostring(_blockUntilBar - bar_index) + ")" :
          not _timeOK ? "DONE (cutoff)" :
          not _lossOK ? "HALTED (daily stop)" :
          i_dirFilter and _orDir == 0  ? "NO TRADE (doji OR)" :
@@ -527,6 +538,7 @@ plotshape(sigShort, title="ORB Pro — Short", style=shape.triangledown, locatio
      color=i_colBear, size=size.normal, text="ORB", textcolor=color.white)
 
 bgcolor(inOR ? color.new(#2196F3, 90) : na, title="OR Window")
+bgcolor(i_newsGuard and not _newsOK ? color.new(#B71C1C, 88) : na, title="News Cooldown")
 
 alertcondition(sigLong,  title="ORB Pro — LONG",     message="ORB-PRO LONG | {{ticker}} | {{close}}")
 alertcondition(sigShort, title="ORB Pro — SHORT",    message="ORB-PRO SHORT | {{ticker}} | {{close}}")

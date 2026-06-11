@@ -1247,16 +1247,21 @@ if i_m10_on and _or15Complete and _or15WidthOK
                 line.delete(_bdmBullRetestLine)
                 _bdmBullRetestLine := na
 
-            // Phase 2: detect retest touch (price returns to within tolerance of OR high)
+            // Phase 2: detect a true PULLBACK to the breakout level.
+            // One-sided test: close must come back DOWN into the zone (level + tol).
+            // An abs-distance test would mark the breakout bar itself as a "retest"
+            // since price has only just crossed the level. ≥ 2 wait bars enforces
+            // at least one full fast bar between break and retest.
             else if not _bdmBullRetest
-                retestDist = math.abs(fast_close - _bdmBullBreakLevel)
-                if retestDist <= fast_atr14 * i_bdm_retestTol
+                if _bdmBullWaitBars >= 2 and fast_close <= _bdmBullBreakLevel + fast_atr14 * i_bdm_retestTol
                     _bdmBullRetest   := true
                     _bdmBullWaitBars := 0   // reset timeout — Phase 3 gets its own window
 
-            // Phase 3: bounce entry (1-min close back above OR high after retest)
+            // Phase 3: bounce entry — a BULLISH fast candle closing back above the level.
+            // Candle direction is the bounce confirmation; without it, any close a tick
+            // above the level (even mid-collapse) would trigger the entry.
             else
-                if fast_close > _bdmBullBreakLevel and not pastCutoff and _entryGateBull
+                if fast_close > _bdmBullBreakLevel and fast_bullBar and not pastCutoff and _entryGateBull
                     entryP10 = fast_close
                     slP10    = _bdmBullBreakLevel - ref_atr14 * i_bdm_slMult
                     tpP10    = entryP10 + (entryP10 - slP10) * i_bdm_rratio
@@ -1295,16 +1300,15 @@ if i_m10_on and _or15Complete and _or15WidthOK
                 line.delete(_bdmBearRetestLine)
                 _bdmBearRetestLine := na
 
-            // Phase 2: detect retest touch
+            // Phase 2: true pullback UP into the zone (level − tol) — see bull path notes
             else if not _bdmBearRetest
-                retestDistB = math.abs(fast_close - _bdmBearBreakLevel)
-                if retestDistB <= fast_atr14 * i_bdm_retestTol
+                if _bdmBearWaitBars >= 2 and fast_close >= _bdmBearBreakLevel - fast_atr14 * i_bdm_retestTol
                     _bdmBearRetest   := true
                     _bdmBearWaitBars := 0
 
-            // Phase 3: bounce entry
+            // Phase 3: bounce entry — a BEARISH fast candle closing back below the level
             else
-                if fast_close < _bdmBearBreakLevel and not pastCutoff and _entryGateBear
+                if fast_close < _bdmBearBreakLevel and fast_bearBar and not pastCutoff and _entryGateBear
                     entryP10b = fast_close
                     slP10b    = _bdmBearBreakLevel + ref_atr14 * i_bdm_slMult
                     tpP10b    = entryP10b - (slP10b - entryP10b) * i_bdm_rratio   // slP10b > entryP10b for shorts, so this yields a price below entry
