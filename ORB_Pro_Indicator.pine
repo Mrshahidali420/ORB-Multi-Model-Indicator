@@ -1,0 +1,553 @@
+// ============================================================
+// ORB Pro — Research-Based Opening Range Breakout  (Pine v6)
+// ============================================================
+// ONE strategy done well, built on documented evidence:
+//
+//  • Zarattini & Aziz (2023) "Can Day Trading Really Be Profitable?"
+//    5-min ORB on QQQ 2016–2023: trade ONLY in the direction of the
+//    opening candle, stop at the opposite side of the opening range,
+//    R-multiple target, end-of-day exit. 33% annualized alpha.
+//
+//  • Zarattini, Barbon & Aziz (2024) "A Profitable Day Trading
+//    Strategy For The U.S. Equity Market": the edge concentrates
+//    almost entirely in HIGH RELATIVE VOLUME sessions ("stocks in
+//    play") — relative volume of the opening window vs its own
+//    multi-day average, not per-bar volume.
+//
+// Design rules applied here:
+//  - Hard gates for factors with documented edge: opening-candle
+//    direction, opening-window relative volume, daily loss stop.
+//  - Confluence score (threshold-gated) for context factors:
+//    VWAP side, HTF trend, gap alignment, OR width quality.
+//  - Honest stats: same-bar TP+SL hit counts as a LOSS (conservative),
+//    cumulative net R tracked, EOD exits marked at market price.
+//  - Non-repainting: signal logic runs on chart bars; all HTF/daily
+//    data uses confirmed bars (expr[1] + lookahead_on).
+//
+// Recommended: 1-min or 5-min chart, liquid instruments
+// (index ETFs/futures, large-cap stocks; evidence is strongest in
+// US equities — validate on FX/Gold before trusting it there).
+// ============================================================
+//@version=6
+indicator("ORB Pro — Research-Based ORB", shorttitle="ORB-PRO", overlay=true,
+     max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================================================
+// SECTION 1 — INPUTS
+// ============================================================
+
+// ── Opening Range ─────────────────────────────────────────────
+i_orMins     = input.int(15, "Opening Range Length (min)", minval=5, maxval=60, step=5, group="Opening Range",
+     tooltip="The papers used 5 min; 15 min trades less but filters more noise. 5 = aggressive, 15 = balanced, 30 = conservative.")
+i_sessionStr = input.session("0930-1600", "Trading Session (NY time)", group="Opening Range")
+i_cutoffHour = input.int(12, "No New Entries After (NY hour)", minval=10, maxval=15, group="Opening Range",
+     tooltip="ORB edge decays after the morning. Default: no new entries after 12:00 NY.")
+
+// ── Entry Gates (hard filters — the documented edge) ─────────
+i_dirFilter   = input.bool(true, "Opening-Candle Direction Filter", group="Entry Gates",
+     tooltip="Core paper rule: trade ONLY in the direction the opening range candle closed.\nBullish OR candle → longs only. Bearish → shorts only. Doji → no trade.")
+i_minRVOL     = input.float(1.5, "Min Relative Volume (OR window vs 14-day avg)", minval=0.0, step=0.1, group="Entry Gates",
+     tooltip="Volume traded DURING today's opening window divided by the average of the same window over the last 14 sessions.\nThe 2024 paper found the edge concentrates above ~2.0; 1.5 is a balanced default. 0 disables.\nPasses automatically while history is still building or the feed has no volume.")
+i_breakBufATR = input.float(0.0, "Breakout Buffer (× ATR14)", minval=0.0, maxval=1.0, step=0.05, group="Entry Gates",
+     tooltip="Require close beyond OR level + buffer. 0 = classic ORB. 0.05–0.10 cuts false breaks at the cost of later entries.")
+i_minScore    = input.int(60, "Min Confluence Score (0–100)", minval=0, maxval=100, group="Entry Gates",
+     tooltip="Context score must reach this before a signal fires. Components: RVOL 30, VWAP 20, opening-candle dir 15, HTF trend 15, gap 10, OR width 10.")
+i_maxLossDay  = input.int(2, "Daily Stop: Halt After N Losses", minval=0, maxval=10, group="Entry Gates",
+     tooltip="No new signals for the rest of the day after this many losing resolutions today. 0 = off.")
+
+// ── Risk ──────────────────────────────────────────────────────
+i_slMode   = input.string("Opposite OR Side", "Stop-Loss Basis", options=["Opposite OR Side", "OR Midpoint", "ATR"], group="Risk",
+     tooltip="Opposite OR Side = the papers' rule. OR Midpoint = tighter (better R, lower win rate). ATR = fixed volatility stop.")
+i_atrCapOn = input.bool(true, "Cap Risk At", group="Risk", inline="cap")
+i_atrCap   = input.float(1.5, "× ATR14", minval=0.25, maxval=5.0, step=0.25, group="Risk", inline="cap",
+     tooltip="If the OR-based stop implies more risk than this many ATRs, the stop is tightened to the cap. Prevents huge-OR days from blowing risk sizing.")
+i_rr       = input.float(2.0, "Take-Profit (R multiple)", minval=0.5, maxval=10.0, step=0.5, group="Risk",
+     tooltip="Target = entry + R × risk. The 2023 paper used 10R + EOD exit (low win rate, big winners). 2R is a balanced default for alert-based trading.")
+i_eodExit  = input.bool(true, "EOD Exit", group="Risk", inline="eod",
+     tooltip="Close any open tracked trade at this NY time, at market price. Removes overnight risk — part of the papers' rules.")
+i_eodHour  = input.int(15, "NY hour", minval=10, maxval=22, group="Risk", inline="eod")
+i_eodMin   = input.int(55, "min", minval=0, maxval=59, group="Risk", inline="eod")
+
+// ── Context (scored, never hard gates) ────────────────────────
+i_htfTF = input.timeframe("60", "HTF Trend Timeframe", group="Context",
+     tooltip="EMA20/50 trend alignment on this TF feeds the confluence score (15 pts).")
+
+// ── Visuals ───────────────────────────────────────────────────
+i_showBox   = input.bool(true,  "Show OR Box + Levels",  group="Visuals")
+i_showSLTP  = input.bool(true,  "Show Entry/SL/TP Zones", group="Visuals")
+i_showLbl   = input.bool(true,  "Show Signal Labels",     group="Visuals")
+i_showDash  = input.bool(true,  "Show Dashboard",         group="Visuals")
+i_dashPos   = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group="Visuals")
+i_colBull   = input.color(color.new(#00E676, 0),  "Bull Color", group="Visuals")
+i_colBear   = input.color(color.new(#FF1744, 0),  "Bear Color", group="Visuals")
+i_colOR     = input.color(color.new(#2196F3, 80), "OR Box Fill", group="Visuals")
+i_colORLine = input.color(color.new(#2196F3, 0),  "OR Line",     group="Visuals")
+
+// ============================================================
+// SECTION 2 — CONSTANTS & HELPERS
+// ============================================================
+
+string NY_TZ = "America/New_York"
+
+// "0930-HHMM" session string for the OR window (9:30 + duration)
+f_orEndStr(durMins) =>
+    totalMins = 9 * 60 + 30 + durMins
+    endH = int(totalMins / 60)
+    endM = totalMins - endH * 60
+    hStr = endH < 10 ? "0" + str.tostring(endH) : str.tostring(endH)
+    mStr = endM < 10 ? "0" + str.tostring(endM) : str.tostring(endM)
+    "0930-" + hStr + mStr
+
+orSessStr = f_orEndStr(i_orMins)
+
+f_tablePos(p) =>
+    p == "Top Right" ? position.top_right : p == "Top Left" ? position.top_left :
+     p == "Bottom Right" ? position.bottom_right : position.bottom_left
+
+// ============================================================
+// SECTION 3 — DATA (non-repainting)
+// ============================================================
+
+atr14   = ta.atr(14)
+vwapVal = ta.vwap(hlc3)
+
+// Confirmed-bar idiom everywhere: expr[1] + lookahead_on returns the value of
+// the last COMPLETED higher-TF bar — identical on historical and realtime bars.
+htfClose = request.security(syminfo.tickerid, i_htfTF, close[1],             lookahead=barmerge.lookahead_on)
+htfEma20 = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, 20)[1], lookahead=barmerge.lookahead_on)
+htfEma50 = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
+
+// Daily: today's open is fixed at day start (leak-free with lookahead_on);
+// previous close / ATR are confirmed values.
+dOpen   = request.security(syminfo.tickerid, "D", open,           lookahead=barmerge.lookahead_on)
+pdClose = request.security(syminfo.tickerid, "D", close[1],       lookahead=barmerge.lookahead_on)
+dATR    = request.security(syminfo.tickerid, "D", ta.atr(14)[1],  lookahead=barmerge.lookahead_on)
+
+// ============================================================
+// SECTION 4 — STATE
+// ============================================================
+
+var int _lastDay = 0
+
+// Opening range
+var float _orH         = na
+var float _orL         = na
+var bool  _orDone      = false
+var float _orOpen      = na     // open of the first bar in the OR window
+var float _orLastClose = na     // close of the most recent bar in the OR window
+var int   _orDir       = 0      // opening-candle direction: 1 bull, -1 bear, 0 doji
+
+// Opening-window relative volume (vs 14-day history of the SAME window)
+var float   _orVolToday = 0.0
+var float   _rvolOR     = na
+var float[] _orVolHist  = array.new<float>()
+
+// Once-per-day signal guards + daily risk stop
+var bool _firedLong   = false
+var bool _firedShort  = false
+var int  _lossesToday = 0
+
+// Last signal snapshot (for alert message + dashboard)
+var float _lastEntry = na
+var float _lastSL    = na
+var float _lastTP    = na
+var int   _lastDir   = 0
+var float _lastScore = 0.0
+
+// Trade tracking (parallel arrays)
+var float[] _tEntry  = array.new<float>()
+var float[] _tSL     = array.new<float>()
+var float[] _tTP     = array.new<float>()
+var int[]   _tDir    = array.new<int>()    //  1 long, -1 short
+var int[]   _tBar    = array.new<int>()
+var int[]   _tStatus = array.new<int>()    //  0 open, 1 TP, -1 SL, 2 EOD close
+
+// Cumulative honest stats
+var int   _wins   = 0
+var int   _losses = 0
+var float _netR   = 0.0
+
+// Visual objects
+var box[]   _boxes  = array.new<box>()
+var line[]  _lines  = array.new<line>()
+var label[] _labels = array.new<label>()
+var line _orHLine = na
+var line _orLLine = na
+var box  _orBox   = na
+
+var table _dash = na
+var table _warn = na
+
+// ============================================================
+// SECTION 5 — SESSION & DAY RESET
+// ============================================================
+
+inOR   = not na(time(timeframe.period, orSessStr,   NY_TZ))
+inSess = not na(time(timeframe.period, i_sessionStr, NY_TZ))
+nyHour = hour(time,   NY_TZ)
+nyMin  = minute(time, NY_TZ)
+
+currentDay = year(time, NY_TZ) * 10000 + month(time, NY_TZ) * 100 + dayofmonth(time, NY_TZ)
+_newDay = currentDay != _lastDay
+
+if _newDay
+    _lastDay     := currentDay
+    _orH         := na
+    _orL         := na
+    _orDone      := false
+    _orOpen      := na
+    _orLastClose := na
+    _orDir       := 0
+    _orVolToday  := 0.0
+    _rvolOR      := na
+    _firedLong   := false
+    _firedShort  := false
+    _lossesToday := 0
+    _orHLine     := na
+    _orLLine     := na
+    _orBox       := na
+
+// ============================================================
+// SECTION 6 — OPENING RANGE BUILD + COMPLETION
+// ============================================================
+
+if inOR
+    _orH := na(_orH) ? high : math.max(_orH, high)
+    _orL := na(_orL) ? low  : math.min(_orL, low)
+    if na(_orOpen)
+        _orOpen := open
+    _orLastClose := close
+    _orVolToday  += nz(volume)
+else if not _orDone and not na(_orH)
+    // First bar after the window closes — OR is final, compute derived state once
+    _orDone := true
+    _orDir  := _orLastClose > _orOpen ? 1 : _orLastClose < _orOpen ? -1 : 0
+
+    // Opening-window relative volume vs its own 14-day average (the 2024 paper's filter).
+    // History average EXCLUDES today; today is pushed after the read.
+    histAvg = array.size(_orVolHist) > 0 ? array.avg(_orVolHist) : na
+    _rvolOR := not na(histAvg) and histAvg > 0 and _orVolToday > 0 ? _orVolToday / histAvg : na
+    if _orVolToday > 0
+        array.push(_orVolHist, _orVolToday)
+        if array.size(_orVolHist) > 14
+            array.shift(_orVolHist)
+
+    // Draw OR visuals
+    if i_showBox
+        _orBox := box.new(bar_index, _orH, bar_index, _orL, bgcolor=i_colOR, border_color=i_colORLine, border_width=1)
+        array.push(_boxes, _orBox)
+        _orHLine := line.new(bar_index, _orH, bar_index, _orH, color=i_colORLine, style=line.style_dashed)
+        _orLLine := line.new(bar_index, _orL, bar_index, _orL, color=i_colORLine, style=line.style_dashed)
+        array.push(_lines, _orHLine)
+        array.push(_lines, _orLLine)
+        _dirTxt = _orDir == 1 ? " ▲" : _orDir == -1 ? " ▼" : " —"
+        array.push(_labels, label.new(bar_index, _orH, "OR H " + str.tostring(_orH, format.mintick) + _dirTxt,
+             color=i_colORLine, style=label.style_label_left, textcolor=color.white, size=size.tiny))
+        array.push(_labels, label.new(bar_index, _orL, "OR L " + str.tostring(_orL, format.mintick),
+             color=i_colORLine, style=label.style_label_left, textcolor=color.white, size=size.tiny))
+
+// Extend active OR lines through the day
+if _orDone and not na(_orHLine)
+    line.set_x2(_orHLine, bar_index)
+    line.set_x2(_orLLine, bar_index)
+    if not na(_orBox)
+        box.set_right(_orBox, bar_index)
+
+// ============================================================
+// SECTION 7 — CONFLUENCE SCORE
+// Components: RVOL 30 | VWAP 20 | OR-candle dir 15 | HTF trend 15 | Gap 10 | OR width 10
+// Unavailable data scores NEUTRAL (partial points), never zero — missing data
+// must not silently kill signals on feeds without volume/HTF history.
+// ============================================================
+
+f_score(isLong) =>
+    rvolPts  = na(_rvolOR) ? 15 : _rvolOR >= 2.0 ? 30 : _rvolOR >= 1.5 ? 22 : _rvolOR >= 1.2 ? 12 : 0
+    vwapPts  = na(vwapVal) ? 10 : (isLong ? close > vwapVal : close < vwapVal) ? 20 : 0
+    dirPts   = _orDir == (isLong ? 1 : -1) ? 15 : 0
+    htfPts   = isLong ?
+         (htfClose > htfEma20 and htfEma20 > htfEma50 ? 15 : htfClose > htfEma50 ? 8 : 0) :
+         (htfClose < htfEma20 and htfEma20 < htfEma50 ? 15 : htfClose < htfEma50 ? 8 : 0)
+    gapRaw   = dOpen - pdClose
+    gapAlign = isLong ? gapRaw > 0 : gapRaw < 0
+    gapPts   = na(gapRaw) or na(dATR) or dATR == 0 ? 5 :
+         gapAlign and math.abs(gapRaw) >= 0.2 * dATR ? 10 : gapAlign ? 5 : 0
+    wRatio   = na(atr14) or atr14 == 0 or na(_orH) or na(_orL) ? na : (_orH - _orL) / atr14
+    widthPts = na(wRatio) ? 5 : wRatio >= 0.5 and wRatio <= 2.0 ? 10 : wRatio <= 3.0 ? 5 : 0
+    rvolPts + vwapPts + dirPts + htfPts + gapPts + widthPts
+
+scoreLong  = _orDone ? f_score(true)  : 0
+scoreShort = _orDone ? f_score(false) : 0
+
+// ============================================================
+// SECTION 8 — SIGNAL LOGIC (evaluated on chart bar closes)
+// ============================================================
+
+bool sigLong  = false
+bool sigShort = false
+bool sigEOD   = false
+
+// Hard gates shared by both directions
+_rvolOK  = i_minRVOL <= 0 or na(_rvolOR) or _rvolOR >= i_minRVOL
+_lossOK  = i_maxLossDay <= 0 or _lossesToday < i_maxLossDay
+_timeOK  = inSess and nyHour < i_cutoffHour
+_breakBuf = i_breakBufATR * nz(atr14)
+
+f_stopLong(entryP) =>
+    slRaw = i_slMode == "Opposite OR Side" ? _orL :
+         i_slMode == "OR Midpoint" ? (_orH + _orL) / 2.0 : entryP - nz(atr14)
+    risk = entryP - slRaw
+    if i_atrCapOn and not na(atr14) and risk > i_atrCap * atr14
+        risk := i_atrCap * atr14
+    if na(risk) or risk <= 0
+        risk := nz(atr14, entryP * 0.001)
+    risk
+
+f_stopShort(entryP) =>
+    slRaw = i_slMode == "Opposite OR Side" ? _orH :
+         i_slMode == "OR Midpoint" ? (_orH + _orL) / 2.0 : entryP + nz(atr14)
+    risk = slRaw - entryP
+    if i_atrCapOn and not na(atr14) and risk > i_atrCap * atr14
+        risk := i_atrCap * atr14
+    if na(risk) or risk <= 0
+        risk := nz(atr14, entryP * 0.001)
+    risk
+
+// Pushes to global arrays only (allowed from functions); the _last* scalar
+// snapshot is set at the call site — Pine functions cannot assign globals.
+f_registerTrade(entryP, slP, tpP, dir) =>
+    array.push(_tEntry,  entryP)
+    array.push(_tSL,     slP)
+    array.push(_tTP,     tpP)
+    array.push(_tDir,    dir)
+    array.push(_tBar,    bar_index)
+    array.push(_tStatus, 0)
+
+f_drawTrade(entryP, slP, tpP, isLong, scoreV) =>
+    if i_showSLTP
+        array.push(_boxes, box.new(bar_index, tpP, bar_index + 20, entryP,
+             bgcolor=color.new(i_colBull, 85), border_color=color.new(i_colBull, 40)))
+        array.push(_boxes, box.new(bar_index, entryP, bar_index + 20, slP,
+             bgcolor=color.new(i_colBear, 85), border_color=color.new(i_colBear, 40)))
+        array.push(_lines, line.new(bar_index, entryP, bar_index + 20, entryP, color=color.white, width=2))
+    if i_showLbl
+        yOff = isLong ? low - nz(atr14) : high + nz(atr14)
+        array.push(_labels, label.new(bar_index, yOff,
+             text = (isLong ? "ORB LONG" : "ORB SHORT") +
+                    "\nEntry " + str.tostring(entryP, format.mintick) +
+                    "\nSL "    + str.tostring(slP,    format.mintick) +
+                    "\nTP "    + str.tostring(tpP,    format.mintick) +
+                    "\nScore " + str.tostring(scoreV),
+             color = isLong ? i_colBull : i_colBear,
+             style = isLong ? label.style_label_up : label.style_label_down,
+             textcolor = color.white, size = size.small))
+
+if _orDone and _timeOK and not na(_orH) and not na(_orL)
+    // LONG: close crosses above OR high (+buffer), opening candle bullish (if filtered)
+    _dirOKLong = not i_dirFilter or _orDir == 1
+    if not _firedLong and _dirOKLong and _rvolOK and _lossOK and scoreLong >= i_minScore
+        if close > _orH + _breakBuf and close[1] <= _orH + _breakBuf
+            entryP = close
+            risk   = f_stopLong(entryP)
+            slP    = entryP - risk
+            tpP    = entryP + risk * i_rr
+            sigLong    := true
+            _firedLong := true
+            _lastScore := scoreLong
+            _lastEntry := entryP
+            _lastSL    := slP
+            _lastTP    := tpP
+            _lastDir   := 1
+            f_registerTrade(entryP, slP, tpP, 1)
+            f_drawTrade(entryP, slP, tpP, true, scoreLong)
+
+    // SHORT: close crosses below OR low (−buffer), opening candle bearish (if filtered)
+    _dirOKShort = not i_dirFilter or _orDir == -1
+    if not _firedShort and _dirOKShort and _rvolOK and _lossOK and scoreShort >= i_minScore
+        if close < _orL - _breakBuf and close[1] >= _orL - _breakBuf
+            entryP = close
+            risk   = f_stopShort(entryP)
+            slP    = entryP + risk
+            tpP    = entryP - risk * i_rr
+            sigShort    := true
+            _firedShort := true
+            _lastScore  := scoreShort
+            _lastEntry  := entryP
+            _lastSL     := slP
+            _lastTP     := tpP
+            _lastDir    := -1
+            f_registerTrade(entryP, slP, tpP, -1)
+            f_drawTrade(entryP, slP, tpP, false, scoreShort)
+
+// ============================================================
+// SECTION 9 — TRADE RESOLUTION (honest accounting)
+//  - Never resolves on the entry bar.
+//  - Same-bar TP+SL hit counts as a LOSS (conservative; intrabar
+//    order is unknowable on closed bars — do not flatter the stats).
+//  - Optional EOD close at market price, R-multiple booked as-is.
+// ============================================================
+
+_eodNow = i_eodExit and (nyHour > i_eodHour or (nyHour == i_eodHour and nyMin >= i_eodMin))
+
+trN = array.size(_tStatus)
+if trN > 0
+    for _i = 0 to trN - 1
+        if array.get(_tStatus, _i) == 0 and bar_index > array.get(_tBar, _i)
+            _e   = array.get(_tEntry, _i)
+            _sl  = array.get(_tSL,    _i)
+            _tp  = array.get(_tTP,    _i)
+            _d   = array.get(_tDir,   _i)
+            _rsk = math.abs(_e - _sl)
+            _tpHit = _d == 1 ? high >= _tp : low  <= _tp
+            _slHit = _d == 1 ? low  <= _sl : high >= _sl
+            if _slHit
+                // SL alone, or same-bar conflict → loss (conservative)
+                array.set(_tStatus, _i, -1)
+                _losses      += 1
+                _lossesToday += 1
+                _netR        -= 1.0
+            else if _tpHit
+                array.set(_tStatus, _i, 1)
+                _wins += 1
+                _netR += _rsk > 0 ? math.abs(_tp - _e) / _rsk : i_rr
+            else if _eodNow
+                array.set(_tStatus, _i, 2)
+                _r = _rsk > 0 ? (close - _e) * _d / _rsk : 0.0
+                _netR += _r
+                if _r >= 0
+                    _wins += 1
+                else
+                    _losses      += 1
+                    _lossesToday += 1
+                sigEOD := true
+                if i_showLbl
+                    array.push(_labels, label.new(bar_index, close,
+                         "EOD EXIT " + (_r >= 0 ? "+" : "") + str.tostring(_r, "#.##") + "R",
+                         color=color.new(#607D8B, 20), style=label.style_label_left,
+                         textcolor=color.white, size=size.tiny))
+
+// Trim history
+while array.size(_tEntry) > 300
+    array.shift(_tEntry)
+    array.shift(_tSL)
+    array.shift(_tTP)
+    array.shift(_tDir)
+    array.shift(_tBar)
+    array.shift(_tStatus)
+
+// Object cleanup
+while array.size(_boxes) > 480
+    box.delete(array.shift(_boxes))
+while array.size(_lines) > 480
+    line.delete(array.shift(_lines))
+while array.size(_labels) > 480
+    label.delete(array.shift(_labels))
+
+// ============================================================
+// SECTION 10 — DASHBOARD
+// ============================================================
+
+if i_showDash
+    if na(_dash)
+        _dash := table.new(f_tablePos(i_dashPos), 2, 10,
+             bgcolor=color.new(#1A1D26, 10), border_color=color.new(color.gray, 60),
+             border_width=1, frame_color=color.new(color.gray, 30), frame_width=1)
+
+    _statusTxt = not _orDone ? "BUILDING OR…" :
+         _firedLong  ? "LONG FIRED" :
+         _firedShort ? "SHORT FIRED" :
+         not _timeOK ? "DONE (cutoff)" :
+         not _lossOK ? "HALTED (daily stop)" :
+         i_dirFilter and _orDir == 0  ? "NO TRADE (doji OR)" :
+         i_dirFilter and _orDir == 1  ? "ARMED ▲ LONG ONLY" :
+         i_dirFilter and _orDir == -1 ? "ARMED ▼ SHORT ONLY" : "ARMED ▲▼"
+    _statusClr = _firedLong ? i_colBull : _firedShort ? i_colBear :
+         not _orDone ? color.new(#90CAF9, 0) : color.new(#FFD54F, 0)
+
+    table.cell(_dash, 0, 0, "ORB PRO", text_color=color.white, bgcolor=color.new(#1565C0, 0), text_size=size.small)
+    table.cell(_dash, 1, 0, _statusTxt, text_color=_statusClr, bgcolor=color.new(#1565C0, 0), text_size=size.small)
+
+    _dimTxt = color.new(#90CAF9, 0)
+    _bgN    = color.new(#1A1D26, 10)
+    table.cell(_dash, 0, 1, "OR High / Low", text_color=_dimTxt, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 1, na(_orH) ? "-" : str.tostring(_orH, format.mintick) + " / " + str.tostring(_orL, format.mintick),
+         text_color=color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    table.cell(_dash, 0, 2, "OR Candle Dir", text_color=_dimTxt, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 2, not _orDone ? "-" : _orDir == 1 ? "▲ BULL" : _orDir == -1 ? "▼ BEAR" : "— DOJI",
+         text_color=_orDir == 1 ? i_colBull : _orDir == -1 ? i_colBear : _dimTxt, bgcolor=_bgN, text_size=size.tiny)
+
+    _rvolTxt = na(_rvolOR) ? (_orDone ? "n/a" : "-") : str.tostring(_rvolOR, "#.##") + "×"
+    _rvolClr = na(_rvolOR) ? _dimTxt : _rvolOR >= 2.0 ? color.new(#FF6F00, 0) : _rvolOR >= i_minRVOL ? color.new(#FFD54F, 0) : color.new(#FF6E6E, 0)
+    table.cell(_dash, 0, 3, "RVOL (OR window)", text_color=_dimTxt, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 3, _rvolTxt, text_color=_rvolClr, bgcolor=_bgN, text_size=size.tiny)
+
+    _scTxt = not _orDone ? "-" : "▲ " + str.tostring(scoreLong) + "  ▼ " + str.tostring(scoreShort)
+    table.cell(_dash, 0, 4, "Score (min " + str.tostring(i_minScore) + ")", text_color=_dimTxt, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 4, _scTxt, text_color=color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    _lastTxt = _lastDir == 0 ? "-" : (_lastDir == 1 ? "LONG " : "SHORT ") + str.tostring(_lastEntry, format.mintick) +
+         " | SL " + str.tostring(_lastSL, format.mintick) + " | TP " + str.tostring(_lastTP, format.mintick)
+    table.cell(_dash, 0, 5, "Last Signal", text_color=_dimTxt, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 5, _lastTxt, text_color=_lastDir == 1 ? i_colBull : _lastDir == -1 ? i_colBear : _dimTxt, bgcolor=_bgN, text_size=size.tiny)
+
+    _tot = _wins + _losses
+    _wrTxt = _tot > 0 ? str.tostring(_wins) + "W / " + str.tostring(_losses) + "L  (" + str.tostring(math.round(100.0 * _wins / _tot)) + "%)" : "no closed trades"
+    table.cell(_dash, 0, 6, "Record", text_color=_dimTxt, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 6, _wrTxt, text_color=color.white, bgcolor=_bgN, text_size=size.tiny)
+
+    _nrClr = _netR > 0 ? i_colBull : _netR < 0 ? i_colBear : _dimTxt
+    table.cell(_dash, 0, 7, "Net R (cumulative)", text_color=_dimTxt, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 7, (_netR >= 0 ? "+" : "") + str.tostring(_netR, "#.##") + "R", text_color=_nrClr, bgcolor=_bgN, text_size=size.tiny)
+
+    table.cell(_dash, 0, 8, "Losses Today", text_color=_dimTxt, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 8, str.tostring(_lossesToday) + (i_maxLossDay > 0 ? " / " + str.tostring(i_maxLossDay) : ""),
+         text_color=_lossesToday > 0 ? color.new(#FF6E6E, 0) : _dimTxt, bgcolor=_bgN, text_size=size.tiny)
+
+    _htfTxt = htfClose > htfEma20 and htfEma20 > htfEma50 ? "▲ Bull" : htfClose < htfEma20 and htfEma20 < htfEma50 ? "▼ Bear" : "— Mixed"
+    table.cell(_dash, 0, 9, "HTF " + i_htfTF + "m Trend", text_color=_dimTxt, bgcolor=_bgN, text_size=size.tiny)
+    table.cell(_dash, 1, 9, _htfTxt, text_color=color.white, bgcolor=_bgN, text_size=size.tiny)
+
+// Chart-TF guard: the OR needs at least ~3 chart bars to be meaningful
+_tfTooHigh = timeframe.in_seconds(timeframe.period) * 3 > i_orMins * 60
+if _tfTooHigh
+    if na(_warn)
+        _warn := table.new(position.top_center, 1, 1, bgcolor=color.new(#B71C1C, 10),
+             border_color=color.new(#FF8A80, 0), border_width=1)
+    table.cell(_warn, 0, 0,
+         "⚠ Chart TF too high for a " + str.tostring(i_orMins) + "-min opening range.\nUse a 1-min or 5-min chart.",
+         text_color=color.white, text_size=size.small)
+
+// ============================================================
+// SECTION 11 — PLOTS, BACKGROUND, ALERTS
+// ============================================================
+
+plotshape(sigLong,  title="ORB Pro — Long",  style=shape.triangleup,   location=location.belowbar,
+     color=i_colBull, size=size.normal, text="ORB", textcolor=color.white)
+plotshape(sigShort, title="ORB Pro — Short", style=shape.triangledown, location=location.abovebar,
+     color=i_colBear, size=size.normal, text="ORB", textcolor=color.white)
+
+bgcolor(inOR ? color.new(#2196F3, 90) : na, title="OR Window")
+
+alertcondition(sigLong,  title="ORB Pro — LONG",     message="ORB-PRO LONG | {{ticker}} | {{close}}")
+alertcondition(sigShort, title="ORB Pro — SHORT",    message="ORB-PRO SHORT | {{ticker}} | {{close}}")
+alertcondition(sigEOD,   title="ORB Pro — EOD EXIT", message="ORB-PRO EOD EXIT | {{ticker}} | {{close}}")
+
+// Structured alert() for webhook bots — pipe-delimited, machine-parseable:
+// ORBPRO|side|ticker|entry|sl|tp|score|rvol
+if sigLong
+    alert("ORBPRO|LONG|"  + syminfo.ticker + "|" + str.tostring(_lastEntry, format.mintick) + "|" +
+         str.tostring(_lastSL, format.mintick) + "|" + str.tostring(_lastTP, format.mintick) + "|" +
+         str.tostring(_lastScore, "#") + "|" + (na(_rvolOR) ? "na" : str.tostring(_rvolOR, "#.##")),
+         alert.freq_once_per_bar_close)
+if sigShort
+    alert("ORBPRO|SHORT|" + syminfo.ticker + "|" + str.tostring(_lastEntry, format.mintick) + "|" +
+         str.tostring(_lastSL, format.mintick) + "|" + str.tostring(_lastTP, format.mintick) + "|" +
+         str.tostring(_lastScore, "#") + "|" + (na(_rvolOR) ? "na" : str.tostring(_rvolOR, "#.##")),
+         alert.freq_once_per_bar_close)
+if sigEOD
+    alert("ORBPRO|EODEXIT|" + syminfo.ticker + "|" + str.tostring(close, format.mintick),
+         alert.freq_once_per_bar_close)
+
+// ============================================================
+// END — ORB Pro
+// ============================================================

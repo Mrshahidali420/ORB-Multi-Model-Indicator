@@ -2,6 +2,35 @@
 
 A Pine Script v6 TradingView indicator implementing **7 Opening Range Breakout (ORB) models** for the New York session, plus a **Combined confidence-scoring mode**. Built for discretionary and systematic traders who want multi-model confluence on ORB setups.
 
+> **New:** [`ORB_Pro_Indicator.pine`](ORB_Pro_Indicator.pine) — a separate, research-based single-strategy ORB indicator. See [ORB Pro](#orb-pro--research-based-orb) below.
+
+---
+
+## ORB Pro — Research-Based ORB
+
+`ORB_Pro_Indicator.pine` is a standalone indicator that implements **one ORB strategy done well**, built on the rules documented in two academic studies:
+
+- **Zarattini & Aziz (2023)** — *Can Day Trading Really Be Profitable?* 5-min ORB on QQQ (2016–2023): trade only in the direction of the opening candle, stop at the opposite side of the opening range, R-multiple target, end-of-day exit. Reported 33% annualized alpha.
+- **Zarattini, Barbon & Aziz (2024)** — *A Profitable Day Trading Strategy For The U.S. Equity Market*: the edge concentrates almost entirely in **high relative-volume sessions** — relative volume of the opening window vs its own 14-day average.
+
+What it does differently from the Multi-Model indicator:
+
+| Aspect | Multi-Model | ORB Pro |
+|---|---|---|
+| Strategies | 7 overlapping breakout variants | 1 evidence-based strategy |
+| Direction | any breakout direction | opening-candle direction only (paper rule, toggleable) |
+| Volume filter | per-bar RVOL | **opening-window volume vs 14-day average of the same window** (the papers' filter) |
+| Stop | ATR from OR edge | opposite OR side (paper rule), ATR-capped; midpoint/ATR options |
+| Exit | TP/SL only | TP/SL + **end-of-day exit** (paper rule) |
+| Risk control | none | daily stop after N losses |
+| Same-bar TP+SL | "closer to open wins" heuristic | counted as a **loss** (conservative, honest stats) |
+| Stats | win % | win % + **cumulative net R** |
+| Alerts | text | text + **machine-parseable webhook format** (`ORBPRO\|LONG\|ticker\|entry\|sl\|tp\|score\|rvol`) |
+
+Context factors (VWAP side, HTF trend, gap alignment, OR width quality) feed a 0–100 confluence score with a minimum threshold — they refine entries but never replace the hard gates.
+
+**Honest disclaimer:** the cited evidence is from US equities/ETFs. No indicator guarantees profits, and edges decay. Forward-test on your instrument with alerts before risking money. On FX/Gold the relative-volume filter uses tick volume, which is a proxy.
+
 ---
 
 ## Features
