@@ -69,6 +69,7 @@ Context factors (VWAP side, HTF trend, gap alignment, OR width quality) feed a 0
 - **OR midline, prime-window highlight** — visual aids for the 9:30–10:00 prime window
 - **OR width filter** — optional ATR-based gate to skip low-quality ranges
 - **Timeframe guard** — on-chart warning if the chart TF is higher than a reference TF (signals then fall back to chart-bar closes)
+- **Risk Guards (ported from ORB Pro / XAU Pro)** — news-spike guard (entry cooldown after ≥ 3× ATR bars), optional OR-window relative-volume gate (vs 14-day average of the same window), optional opening-candle direction filter (M9 exempt), daily stop after N losses, and an EOD exit that books open tracked trades at market (default 16:45 NY) so stats can't be polluted by multi-day stale trades. Same-bar TP+SL conflicts now count as a **loss** (conservative).
 
 ---
 

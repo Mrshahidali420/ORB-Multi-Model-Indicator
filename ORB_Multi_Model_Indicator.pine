@@ -29,6 +29,21 @@ i_refTF        = input.timeframe("5", "Primary Reference TF (M3/M4/M6/M7/M9)", g
 i_refTF_fast   = input.timeframe("1", "Fast Reference TF (M1, Combined)", group="Session",
      tooltip="Reference TF for M1 Crabel and Combined mode. CSV data: 1m optimal (60–90% WR).\nSet to '5' to match primary TF if preferred.")
 
+// ── Risk Guards (ported from ORB Pro / XAU Pro) ──────────────
+i_newsGuard = input.bool(true, "News-Spike Guard", group="Risk Guards", inline="ng",
+     tooltip="After any bar with range ≥ 3× ATR14 (data candles, flash moves), ALL new entries are blocked for the cooldown — never chase a news spike. Applies to every model and Combined.")
+i_newsCool  = input.int(6, "cooldown bars", minval=2, maxval=30, group="Risk Guards", inline="ng")
+i_orRvolMin = input.float(0.0, "Min OR-Window RVOL (vs 14-day avg, 0 = off)", minval=0.0, step=0.1, group="Risk Guards",
+     tooltip="Volume traded during the 15-min OR vs the average of the same window over the last 14 sessions — the filter the ORB studies actually used (edge concentrates above ~1.5–2.0).\nApplies to all models as a day-quality gate. Passes while history builds. 0 disables.")
+i_dirFilter = input.bool(false, "Opening-Candle Direction Filter (15-min OR)", group="Risk Guards",
+     tooltip="Only allow signals in the direction the 15-min OR candle closed (Zarattini & Aziz 2023 rule).\nApplies to all models and Combined. M9 Failed-ORB is EXEMPT — it fades breakouts by design.")
+i_maxLossDay = input.int(0, "Daily Stop: Halt After N Losses (0 = off)", minval=0, maxval=10, group="Risk Guards",
+     tooltip="After this many losing trade resolutions today, no new signals from any model for the rest of the day. Recommended 2–3 when trading the alerts.")
+i_eodExit = input.bool(true, "EOD Exit", group="Risk Guards", inline="eod",
+     tooltip="Close all tracked trades at market price at this NY time. Without this, tracked trades can stay open for DAYS until TP/SL is touched, polluting the win-rate stats.")
+i_eodHour = input.int(16, "NY hour", minval=11, maxval=16, group="Risk Guards", inline="eod")
+i_eodMin  = input.int(45, "min", minval=0, maxval=59, group="Risk Guards", inline="eod")
+
 // ── OR Window lengths ────────────────────────────────────────
 i_crabelMins = input.int(15, "Model 1 — Crabel OR Length (min)", minval=5,  maxval=60, group="OR Windows")
 
@@ -228,6 +243,18 @@ var float _or15H         = na
 var float _or15L         = na
 var bool  _or15Complete  = false
 
+// 15-min OR window volume + opening-candle direction (ported from ORB Pro)
+var float   _or15Vol       = 0.0
+var float   _or15RVOL      = na      // OR-window volume vs its own 14-day average
+var float[] _orVolHist     = array.new<float>()
+var float   _or15Open      = na
+var float   _or15CloseLast = na
+var int     _or15Dir       = 0       // 1 bull, -1 bear, 0 doji
+
+// News-spike guard + daily loss stop (ported from XAU Pro)
+var int _blockUntilBar = 0
+var int _lossesToday   = 0
+
 // Crabel OR (user-length)
 var float _orCrabelH         = na
 var float _orCrabelL         = na
@@ -336,6 +363,7 @@ var int[]   _trDir    = array.new<int>()     // 1=bull, -1=bear
 var int[]   _trStatus = array.new<int>()     // 0=active, 1=TP hit, -1=SL hit
 var int[]   _trBar    = array.new<int>()     // bar_index at entry
 var int[]   _trDay    = array.new<int>()     // YYYYMMDD day ID
+var float[] _trExit   = array.new<float>()   // actual exit price (na while open)
 
 // Per-model last signal (size 11: index 0-8 = M1-M9, index 9 = Combined, index 10 = M10)
 var float[] _lastEntry  = array.new<float>(11, na)
@@ -496,6 +524,7 @@ f_inSession(sess) =>
 
 inNYSession = f_inSession(i_sessionOpen)
 nyHour      = hour(time, NY_TZ)
+nyMin       = minute(time, NY_TZ)
 pastCutoff  = nyHour >= i_timeCutoff
 
 in5MinOR   = f_inSession(OR_5MIN_STR)
@@ -536,6 +565,12 @@ if _newDay
     _or15H            := na
     _or15L            := na
     _or15Complete     := false
+    _or15Vol          := 0.0
+    _or15RVOL         := na
+    _or15Open         := na
+    _or15CloseLast    := na
+    _or15Dir          := 0
+    _lossesToday      := 0
     _orCrabelH        := na
     _orCrabelL        := na
     _orCrabelComplete := false
@@ -629,12 +664,25 @@ if in5MinOR
 else if not _or5Complete and not na(_or5H)
     _or5Complete := true
 
-// 15-min OR
+// 15-min OR — also accumulates window volume and the opening-candle direction
 if in15MinOR
     _or15H := na(_or15H) ? high : math.max(_or15H, high)
     _or15L := na(_or15L) ? low  : math.min(_or15L, low)
+    if na(_or15Open)
+        _or15Open := open
+    _or15CloseLast := close
+    _or15Vol       += nz(volume)
 else if not _or15Complete and not na(_or15H)
     _or15Complete := true
+    _or15Dir      := _or15CloseLast > _or15Open ? 1 : _or15CloseLast < _or15Open ? -1 : 0
+    // OR-window relative volume vs its own 14-day average (the studies' "in play" filter).
+    // The average EXCLUDES today; today is pushed after the read.
+    _histAvgOR = array.size(_orVolHist) > 0 ? array.avg(_orVolHist) : na
+    _or15RVOL := not na(_histAvgOR) and _histAvgOR > 0 and _or15Vol > 0 ? _or15Vol / _histAvgOR : na
+    if _or15Vol > 0
+        array.push(_orVolHist, _or15Vol)
+        if array.size(_orVolHist) > 14
+            array.shift(_orVolHist)
 
 // Crabel OR (user-configurable)
 if inCrabelOR
@@ -642,6 +690,30 @@ if inCrabelOR
     _orCrabelL := na(_orCrabelL) ? low  : math.min(_orCrabelL, low)
 else if not _orCrabelComplete and not na(_orCrabelH)
     _orCrabelComplete := true
+
+// ============================================================
+// SECTION 7B — ENTRY GUARDS (ported from ORB Pro / XAU Pro)
+// Composed AFTER OR tracking so same-bar OR direction/RVOL are used.
+// All gates pass-through when disabled or when data is unavailable.
+// ============================================================
+
+// News-spike guard: a bar with range ≥ 3× ATR is a data candle or flash move —
+// spreads widen and first reactions frequently reverse. Stand aside briefly.
+_spikeBar = i_newsGuard and not na(atr14) and atr14 > 0 and (high - low) >= 3.0 * atr14
+if _spikeBar
+    _blockUntilBar := bar_index + i_newsCool
+_newsOK = not i_newsGuard or bar_index >= _blockUntilBar
+
+_orRvolOK = i_orRvolMin <= 0 or na(_or15RVOL) or _or15RVOL >= i_orRvolMin
+_lossOK   = i_maxLossDay <= 0 or _lossesToday < i_maxLossDay
+
+// Direction-neutral guard bundle (news + window RVOL + daily stop)
+_guardOK = _newsOK and _orRvolOK and _lossOK
+
+// Full per-direction entry gates: DXY + guards + optional opening-candle direction.
+// M9 uses _guardOK + DXY only — it fades breakouts, so the direction filter is N/A.
+_entryGateBull = _dxyBullGate and _guardOK and (not i_dirFilter or _or15Dir == 1)
+_entryGateBear = _dxyBearGate and _guardOK and (not i_dirFilter or _or15Dir == -1)
 
 // ============================================================
 // SECTION 8 — FVG DETECTION (inline, after 15-min OR completes)
@@ -745,6 +817,7 @@ f_registerTrade(modelIdx, entryP, slP, tpP, isBull) =>
     array.push(_trStatus, 0)
     array.push(_trBar,    bar_index)
     array.push(_trDay,    year(time, NY_TZ) * 10000 + month(time, NY_TZ) * 100 + dayofmonth(time, NY_TZ))
+    array.push(_trExit,   float(na))
     array.set(_lastEntry,  arrIdx, entryP)
     array.set(_lastSL,     arrIdx, slP)
     array.set(_lastTP,     arrIdx, tpP)
@@ -952,7 +1025,7 @@ f_model7(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap, _gateBu
 if true
     if i_m1_on
         // M1 uses fast TF (default 1m) — best per CSV backtest
-        [b, s] = f_model1(_m1FiredBull, _m1FiredBear, fast_close, fast_close1, fast_atr14, _fastEdge, fast_rvol, _dxyBullGate, _dxyBearGate)
+        [b, s] = f_model1(_m1FiredBull, _m1FiredBear, fast_close, fast_close1, fast_atr14, _fastEdge, fast_rvol, _entryGateBull, _entryGateBear)
         sig_m1_bull := b
         sig_m1_bear := s
         if b
@@ -963,7 +1036,7 @@ if true
             _agreeCountBear += 1
     if i_m3_on
         // M3 uses primary TF (default 5m) — best per CSV backtest
-        [b, s] = f_model3(_m3FiredBull, _m3FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, _dxyBullGate, _dxyBearGate)
+        [b, s] = f_model3(_m3FiredBull, _m3FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, _entryGateBull, _entryGateBear)
         sig_m3_bull := b
         sig_m3_bear := s
         if b
@@ -974,7 +1047,7 @@ if true
             _agreeCountBear += 1
     if i_m4_on
         // M4 uses primary TF (default 5m)
-        [b, s] = f_model4(_m4FiredBull, _m4FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, ref_rsi14, _dxyBullGate, _dxyBearGate)
+        [b, s] = f_model4(_m4FiredBull, _m4FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, ref_rsi14, _entryGateBull, _entryGateBear)
         sig_m4_bull := b
         sig_m4_bear := s
         if b
@@ -985,7 +1058,7 @@ if true
             _agreeCountBear += 1
     if i_m7_on
         // M7 uses primary TF (default 5m)
-        [b, s] = f_model7(_m7FiredBull, _m7FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, _dxyBullGate, _dxyBearGate)
+        [b, s] = f_model7(_m7FiredBull, _m7FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, _entryGateBull, _entryGateBear)
         sig_m7_bull := b
         sig_m7_bear := s
         if b
@@ -1010,7 +1083,7 @@ if i_m6_on and _or15Complete and not na(_or15H) and not na(_or15L) and _or15Widt
             fvgSz = _fvgTop - _fvgBot
             if fvgSz >= minFvgSz
                 // Price pulls back into FVG zone and closes back above it — bounce entry at close
-                if ref_low <= _fvgTop and ref_close > _fvgTop and ref_close > ref_vwap and _dxyBullGate
+                if ref_low <= _fvgTop and ref_close > _fvgTop and ref_close > ref_vwap and _entryGateBull
                     sig_m6_bull   := true
                     entryP         = ref_close          // actual fill price, not the stale FVG top
                     slP            = _fvgBot - slDist * 0.5
@@ -1027,7 +1100,7 @@ if i_m6_on and _or15Complete and not na(_or15H) and not na(_or15L) and _or15Widt
         if _fvgBear and not na(_fvgTop) and not na(_fvgBot) and not _fvgTriggered and bar_index > _fvgFormedBar
             fvgSz = _fvgTop - _fvgBot
             if fvgSz >= minFvgSz
-                if ref_high >= _fvgBot and ref_close < _fvgBot and ref_close < ref_vwap and _dxyBearGate
+                if ref_high >= _fvgBot and ref_close < _fvgBot and ref_close < ref_vwap and _entryGateBear
                     sig_m6_bear   := true
                     entryP         = ref_close          // actual fill price, not the stale FVG bot
                     slP            = _fvgTop + slDist * 0.5
@@ -1075,7 +1148,7 @@ if i_m9_on and _or15Complete and not na(_or15H) and not na(_or15L) and _or15Widt
                 _m9BullBreak   := false
                 _m9InsideCount := 0
                 // Fire on confirmed failure — DXY gate + once-per-day guard
-                if _dxyBearGate and not _m9FiredBear
+                if _dxyBearGate and _guardOK and not _m9FiredBear
                     sig_m9_bear    := true
                     _m9FiredBear   := true
                     entryP          = ref_close
@@ -1102,7 +1175,7 @@ if i_m9_on and _or15Complete and not na(_or15H) and not na(_or15L) and _or15Widt
                 _m9BearBreak   := false
                 _m9InsideCount := 0
                 // Fire on confirmed failure — DXY gate + once-per-day guard
-                if _dxyBullGate and not _m9FiredBull
+                if _dxyBullGate and _guardOK and not _m9FiredBull
                     sig_m9_bull    := true
                     _m9FiredBull   := true
                     entryP          = ref_close
@@ -1183,7 +1256,7 @@ if i_m10_on and _or15Complete and _or15WidthOK
 
             // Phase 3: bounce entry (1-min close back above OR high after retest)
             else
-                if fast_close > _bdmBullBreakLevel and not pastCutoff and _dxyBullGate
+                if fast_close > _bdmBullBreakLevel and not pastCutoff and _entryGateBull
                     entryP10 = fast_close
                     slP10    = _bdmBullBreakLevel - ref_atr14 * i_bdm_slMult
                     tpP10    = entryP10 + (entryP10 - slP10) * i_bdm_rratio
@@ -1231,7 +1304,7 @@ if i_m10_on and _or15Complete and _or15WidthOK
 
             // Phase 3: bounce entry
             else
-                if fast_close < _bdmBearBreakLevel and not pastCutoff and _dxyBearGate
+                if fast_close < _bdmBearBreakLevel and not pastCutoff and _entryGateBear
                     entryP10b = fast_close
                     slP10b    = _bdmBearBreakLevel + ref_atr14 * i_bdm_slMult
                     tpP10b    = entryP10b - (slP10b - entryP10b) * i_bdm_rratio   // slP10b > entryP10b for shorts, so this yields a price below entry
@@ -1282,6 +1355,10 @@ for _si = 0 to 6
 // Resolves active trades against bar price action each bar
 // ============================================================
 
+// EOD flat time reached (NY) — remaining open trades are booked at market
+bool sigEOD = false
+_eodNow = i_eodExit and (nyHour > i_eodHour or (nyHour == i_eodHour and nyMin >= i_eodMin))
+
 trSz = array.size(_trStatus)
 if trSz > 0
     for _ti = 0 to trSz - 1
@@ -1295,53 +1372,44 @@ if trSz > 0
             _tDir   = array.get(_trDir,   _ti)
             _tpHit  = _tDir == 1 ? high >= _tTP : low  <= _tTP
             _slHit  = _tDir == 1 ? low  <= _tSL : high >= _tSL
-            if _tpHit and _slHit
-                // Same-bar conflict: closer to open wins; candle direction as tiebreaker
-                _distToTP = math.abs(open - _tTP)
-                _distToSL = math.abs(open - _tSL)
-                _bullCandle = close >= open
-                _outcome = 0
-                if _distToSL < _distToTP
-                    _outcome := -1  // SL closer to open → SL hit
-                else if _distToTP < _distToSL
-                    _outcome := 1   // TP closer to open → TP hit
-                else
-                    // Equal distance: use candle direction
-                    _outcome := (_tDir == 1 and _bullCandle) or (_tDir == -1 and not _bullCandle) ? 1 : -1
-                array.set(_trStatus, _ti, _outcome)
+            _resolved = false
+            // SL checked FIRST: a same-bar TP+SL conflict counts as a LOSS.
+            // Intrabar order is unknowable on closed bars — never flatter the stats.
+            if _slHit
+                array.set(_trStatus, _ti, -1)
+                array.set(_trExit,   _ti, _tSL)
                 _mI = array.get(_trModel, _ti) - 1
-                if _outcome == 1
-                    array.set(_mWins,   _mI, array.get(_mWins,   _mI) + 1)
+                array.set(_mLosses, _mI, array.get(_mLosses, _mI) + 1)
+                _cs = array.get(_mStreak, _mI)
+                array.set(_mStreak, _mI, _cs < 0 ? _cs - 1 : -1)
+                _lossesToday += 1
+                _resolved := true
+            else if _tpHit
+                array.set(_trStatus, _ti, 1)
+                array.set(_trExit,   _ti, _tTP)
+                _mI = array.get(_trModel, _ti) - 1
+                array.set(_mWins, _mI, array.get(_mWins, _mI) + 1)
+                _cs = array.get(_mStreak, _mI)
+                array.set(_mStreak, _mI, _cs > 0 ? _cs + 1 : 1)
+                _resolved := true
+            else if _eodNow
+                // EOD flat at market — win/loss booked by the sign of the result
+                array.set(_trStatus, _ti, 2)
+                array.set(_trExit,   _ti, close)
+                _mI = array.get(_trModel, _ti) - 1
+                _eodGain = (close - _tEntry) * _tDir
+                if _eodGain >= 0
+                    array.set(_mWins, _mI, array.get(_mWins, _mI) + 1)
                     _cs = array.get(_mStreak, _mI)
                     array.set(_mStreak, _mI, _cs > 0 ? _cs + 1 : 1)
                 else
                     array.set(_mLosses, _mI, array.get(_mLosses, _mI) + 1)
                     _cs = array.get(_mStreak, _mI)
                     array.set(_mStreak, _mI, _cs < 0 ? _cs - 1 : -1)
-                _bTP = array.get(_trBoxTP, _ti)
-                _bSL = array.get(_trBoxSL, _ti)
-                if not na(_bTP)
-                    box.set_right(_bTP, bar_index)
-                if not na(_bSL)
-                    box.set_right(_bSL, bar_index)
-            else if _tpHit
-                array.set(_trStatus, _ti, 1)
-                _mI = array.get(_trModel, _ti) - 1
-                array.set(_mWins, _mI, array.get(_mWins, _mI) + 1)
-                _cs = array.get(_mStreak, _mI)
-                array.set(_mStreak, _mI, _cs > 0 ? _cs + 1 : 1)
-                _bTP = array.get(_trBoxTP, _ti)
-                _bSL = array.get(_trBoxSL, _ti)
-                if not na(_bTP)
-                    box.set_right(_bTP, bar_index)
-                if not na(_bSL)
-                    box.set_right(_bSL, bar_index)
-            else if _slHit
-                array.set(_trStatus, _ti, -1)
-                _mI = array.get(_trModel, _ti) - 1
-                array.set(_mLosses, _mI, array.get(_mLosses, _mI) + 1)
-                _cs = array.get(_mStreak, _mI)
-                array.set(_mStreak, _mI, _cs < 0 ? _cs - 1 : -1)
+                    _lossesToday += 1
+                sigEOD := true
+                _resolved := true
+            if _resolved
                 _bTP = array.get(_trBoxTP, _ti)
                 _bSL = array.get(_trBoxSL, _ti)
                 if not na(_bTP)
@@ -1359,6 +1427,7 @@ while array.size(_trEntry) > i_maxTrades
     array.shift(_trStatus)
     array.shift(_trBar)
     array.shift(_trDay)
+    array.shift(_trExit)
     array.shift(_trBoxTP)
     array.shift(_trBoxSL)
 
@@ -1500,7 +1569,7 @@ if i_comb_on and _or15Complete and not na(_or15H) and not na(_or15L) and _or15Wi
              (na(dxy_close) or na(dxy_ema20)) ? true : dxy_close > dxy_ema20
         slDist = fast_atr14 * i_atrMult
 
-        if fast_close > _or15H and fast_close1 <= _or15H and not _combLongFired and _dxyBullish
+        if fast_close > _or15H and fast_close1 <= _or15H and not _combLongFired and _dxyBullish and _guardOK and (not i_dirFilter or _or15Dir == 1)
             score = f_confidence(true, fast_close, fast_atr14, fast_rvol, fast_vwap, fast_high, fast_low, fast_bullBar, fast_bearBar, dxy_close, dxy_ema20, dxy_ema50)
             if score >= float(i_minScore)
                 sig_comb_bull   := true
@@ -1524,7 +1593,7 @@ if i_comb_on and _or15Complete and not na(_or15H) and not na(_or15L) and _or15Wi
                          textcolor = color.white,
                          size      = size.normal))
 
-        if fast_close < _or15L and fast_close1 >= _or15L and not _combShortFired and _dxyBearish
+        if fast_close < _or15L and fast_close1 >= _or15L and not _combShortFired and _dxyBearish and _guardOK and (not i_dirFilter or _or15Dir == -1)
             score = f_confidence(false, fast_close, fast_atr14, fast_rvol, fast_vwap, fast_high, fast_low, fast_bullBar, fast_bearBar, dxy_close, dxy_ema20, dxy_ema50)
             if score >= float(i_minScore)
                 sig_comb_bear   := true
@@ -1771,9 +1840,15 @@ if i_showDashboard and not na(_dashTable)
          dxy_close < dxy_ema20 ? color.new(#00E676, 0) :
          dxy_close > dxy_ema20 ? color.new(#FF5252, 0) : C_TXT_DIM
     table.cell(_dashTable, 6, 8, _dxyStatusStr, text_color=_dxyStatusClr, bgcolor=C_NONE, text_size=_dashSz)
-    table.cell(_dashTable, 7, 8, "", text_color=C_TXT_DIM, bgcolor=C_NONE, text_size=_dashSz)
-    table.cell(_dashTable, 8, 8, "", text_color=C_TXT_DIM, bgcolor=C_NONE, text_size=_dashSz)
-    table.cell(_dashTable, 9, 8, "", text_color=C_TXT_DIM, bgcolor=C_NONE, text_size=_dashSz)
+    // OR-window RVOL (the studies' filter) — shown even when the gate is off
+    _orRvolStr = na(_or15RVOL) ? "OR-RVOL: -" : "OR-RVOL: " + str.tostring(_or15RVOL, "#.##") + "×"
+    _orRvolClr = na(_or15RVOL) ? C_TXT_DIM : _or15RVOL >= 2.0 ? color.new(#FF6F00,0) : _or15RVOL >= 1.5 ? color.new(#FF9800,0) : C_TXT_DIM
+    table.cell(_dashTable, 7, 8, _orRvolStr, text_color=_orRvolClr, bgcolor=C_NONE, text_size=_dashSz)
+    _guardStr = not i_newsGuard ? "" : _newsOK ? "GUARD ✓" : "⛔ NEWS (" + str.tostring(_blockUntilBar - bar_index) + ")"
+    table.cell(_dashTable, 8, 8, _guardStr, text_color=_newsOK ? C_TXT_DIM : color.new(#FF6E6E,0), bgcolor=C_NONE, text_size=_dashSz)
+    _dayLossStr = i_maxLossDay > 0 ? "DayLoss " + str.tostring(_lossesToday) + "/" + str.tostring(i_maxLossDay) :
+         _lossesToday > 0 ? "DayLoss " + str.tostring(_lossesToday) : ""
+    table.cell(_dashTable, 9, 8, _dayLossStr, text_color=not _lossOK ? color.new(#FF6E6E,0) : C_TXT_DIM, bgcolor=C_NONE, text_size=_dashSz)
 
     // Day Bias row (row 9)
     biasClr = _dayBias == "BULLISH" ? color.new(#00E676,0) :
@@ -1784,7 +1859,9 @@ if i_showDashboard and not na(_dashTable)
     table.cell(_dashTable, 0, 9, "DAY BIAS",        text_color=C_TXT,    bgcolor=C_HEAD, text_size=_dashSz)
     table.cell(_dashTable, 1, 9, _dayBias,           text_color=biasClr,  bgcolor=biasBG, text_size=_dashSz)
     table.cell(_dashTable, 2, 9, biasScoreStr,        text_color=biasClr,  bgcolor=biasBG, text_size=_dashSz)
-    table.cell(_dashTable, 3, 9, "",                  text_color=C_TXT_DIM,bgcolor=C_NONE, text_size=_dashSz)
+    _orDirStr = not _or15Complete ? "" : _or15Dir == 1 ? "OR ▲" : _or15Dir == -1 ? "OR ▼" : "OR —"
+    _orDirClr = _or15Dir == 1 ? i_colBull : _or15Dir == -1 ? i_colBear : C_TXT_DIM
+    table.cell(_dashTable, 3, 9, _orDirStr,           text_color=_orDirClr,bgcolor=C_NONE, text_size=_dashSz)
     table.cell(_dashTable, 4, 9, "",                  text_color=C_TXT_DIM,bgcolor=C_NONE, text_size=_dashSz)
     table.cell(_dashTable, 5, 9, "",                  text_color=C_TXT_DIM,bgcolor=C_NONE, text_size=_dashSz)
     table.cell(_dashTable, 6, 9, "",                  text_color=C_TXT_DIM,bgcolor=C_NONE, text_size=_dashSz)
@@ -1832,8 +1909,9 @@ if i_showTradeTable
                 _tSl2  = array.get(_trSL,     _ti2)
                 _tTp2  = array.get(_trTP,     _ti2)
 
-                // Pip P&L: closed = TP/SL price; active = current ref_close (live unrealised)
-                _exitP   = _tSt == 1 ? _tTp2 : _tSt == -1 ? _tSl2 : ref_close
+                // Pip P&L: closed = stored exit price (TP/SL/EOD); active = current ref_close
+                _exitStored = array.get(_trExit, _ti2)
+                _exitP   = _tSt == 0 or na(_exitStored) ? ref_close : _exitStored
                 _pipsRaw = (_exitP - _tEnt) * float(_tDir2) / _pipSize
                 _pipsStr = f_formatPips(_pipsRaw)
                 _pipsClr = _tSt == 0 ? color.new(#FF9800, 0) :
@@ -1848,9 +1926,11 @@ if i_showTradeTable
                              _tMdl == 11 ? "M10 BDM"   : "Combined"
                 _dirStr2 = _tDir2 == 1 ? "▲ LONG" : "▼ SHORT"
                 _dirClr  = _tDir2 == 1 ? i_colBull : i_colBear
-                _stStr   = _tSt == 0 ? "IN PROG" : _tSt == 1 ? "TP HIT" : "SL HIT"
-                _stClr   = _tSt == 0 ? color.new(#FF9800,0) : _tSt == 1 ? color.new(#00E676,0) : color.new(#FF1744,0)
-                _rowBG2  = _tSt == 0 ? color.new(#FF9800,85) : _tSt == 1 ? color.new(#00E676,85) : color.new(#FF1744,85)
+                _stStr   = _tSt == 0 ? "IN PROG" : _tSt == 1 ? "TP HIT" : _tSt == 2 ? "EOD" : "SL HIT"
+                _stClr   = _tSt == 0 ? color.new(#FF9800,0) : _tSt == 1 ? color.new(#00E676,0) :
+                           _tSt == 2 ? color.new(#90A4AE,0) : color.new(#FF1744,0)
+                _rowBG2  = _tSt == 0 ? color.new(#FF9800,85) : _tSt == 1 ? color.new(#00E676,85) :
+                           _tSt == 2 ? color.new(#90A4AE,85) : color.new(#FF1744,85)
                 table.cell(_tradeTable, 0, _displayRow, _mNameStr,                           text_color=C_TXT,   bgcolor=_rowBG2, text_size=_dashSz)
                 table.cell(_tradeTable, 1, _displayRow, _dirStr2,                            text_color=_dirClr, bgcolor=_rowBG2, text_size=_dashSz)
                 table.cell(_tradeTable, 2, _displayRow, str.tostring(_tEnt, format.mintick), text_color=C_TXT,   bgcolor=_rowBG2, text_size=_dashSz)
@@ -2085,6 +2165,8 @@ alertcondition(
      ((sig_m1_bear or sig_m3_bear or sig_m4_bear or sig_m6_bear or sig_m7_bear or sig_m9_bear or sig_m10_bear) and _agreeCountBear >= i_minAgree),
      title="ANY ORB — SHORT", message="ORB Signal SHORT | {{ticker}} | {{close}}")
 
+alertcondition(sigEOD, title="EOD Exit — open trades closed", message="ORB EOD EXIT | {{ticker}} | {{close}}")
+
 // ============================================================
 // SECTION 23 — DYNAMIC alert() (once per bar close, with context)
 // ============================================================
@@ -2140,6 +2222,10 @@ if _refEdge or _fastEdge
              _dxyAlertSuffix,
              alert.freq_once_per_bar_close)
 
+// EOD exit alert — independent of ref-TF edges
+if sigEOD
+    alert("ORB EOD EXIT | " + syminfo.ticker + " | " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
 // ============================================================
 // SECTION 24 — BACKGROUND COLORING
 // ============================================================
@@ -2150,6 +2236,9 @@ bgcolor(in5MinOR  ? color.new(#00BCD4, 88) : na, title="5-Min OR Window Highligh
 
 // Prime window highlight — gold tint on first 30 min of NY session
 bgcolor(i_showPrimeWindow and _primeWindow ? color.new(#FFD600, 91) : na, title="Prime Window Highlight (9:30-10:00 NY)")
+
+// News-spike cooldown — red tint while entries are blocked
+bgcolor(i_newsGuard and not _newsOK ? color.new(#B71C1C, 88) : na, title="News Cooldown")
 
 // Color bars with abnormally high RVOL
 barcolor(rvol >= 2.0 ? color.new(#FF6F00, 0) : rvol >= 1.5 ? color.new(#F9A825, 30) : na,
