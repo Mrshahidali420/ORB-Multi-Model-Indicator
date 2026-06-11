@@ -8,12 +8,14 @@ A Pine Script v6 TradingView indicator implementing **7 Opening Range Breakout (
 
 - **7 independent ORB models** — each with its own OR window, entry TF, and signal logic
 - **Combined mode** — single signal scored by 8 weighted confidence factors; only fires above a minimum score threshold
+- **Non-repainting** — all higher-timeframe data uses confirmed-bar values (`expr[1]` + `lookahead_on`), so live signals match the backtest; NR7/NR4 and previous-day levels use completed days only
 - **Automatic DST handling** — NY session detection via IANA timezone (`America/New_York`)
 - **Per-model performance dashboard** — win rate, streak, score, agreement count, and BEST badge
-- **22 alert conditions** — one per model direction, plus Combined bull/bear
+- **18 alert conditions** — one per model direction, Combined bull/bear, plus ANY-signal catch-alls
 - **Economic event markers** — CPI / NFP on Day Bias label (Gold charts)
 - **OR midline, prime-window highlight** — visual aids for the 9:30–10:00 prime window
 - **OR width filter** — optional ATR-based gate to skip low-quality ranges
+- **Timeframe guard** — on-chart warning if the chart TF is higher than a reference TF (signals then fall back to chart-bar closes)
 
 ---
 
@@ -74,7 +76,7 @@ Confidence factors (each weighted 0–100):
 
 ## Backtested Performance
 
-See [`indicator stats - Sheet1.csv`](indicator%20stats%20-%20Sheet1.csv) for win-rate data across instruments and timeframes used to select the active model set.
+The active model set (and the disabled-by-default M6/M9) was selected from CSV win-rate backtests across instruments and timeframes.
 
 Best results observed on:
 - **AUDUSD** — strong across most models
@@ -87,7 +89,7 @@ Best results observed on:
 
 - TradingView account (free or paid)
 - Pine Script v6 (built-in to TradingView editor)
-- Recommended chart timeframe: **1-min or 5-min**
+- Chart timeframe: **must be at or below the Fast Reference TF (default 1-min)** for the intended behavior — Pine cannot sample a lower timeframe than the chart, so on higher chart TFs signals fall back to chart-bar closes and a red warning is shown on the chart. Recommended: **1-min chart** (1-min and 5-min reference TFs both resolve correctly).
 
 ---
 

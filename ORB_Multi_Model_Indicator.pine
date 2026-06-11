@@ -1,7 +1,7 @@
 // ============================================================
 // ORB Multi-Model Indicator  —  Pine Script v6
-// 6 Opening Range Breakout models + Combined confidence mode
-// New York session | Auto DST via IANA timezone
+// 7 Opening Range Breakout models + Combined confidence mode
+// New York session | Auto DST via IANA timezone | Non-repainting
 // ============================================================
 //@version=6
 indicator("ORB Multi-Model Indicator", shorttitle="ORB-MMI", overlay=true,
@@ -244,7 +244,6 @@ var int   _fvgFormedBar  = -1  // bar_index when FVG was detected; gate signal t
 // Model 9 — failed ORB state
 var bool _m9BullBreak   = false
 var bool _m9BearBreak   = false
-var int  _m9BreakBar    = 0
 var int  _m9InsideCount = 0
 var bool _m9FiredBull   = false  // once-per-day guard
 var bool _m9FiredBear   = false  // once-per-day guard
@@ -327,7 +326,6 @@ var bool   _confBull  = false
 
 // Dashboard tables
 var table _dashTable  = na
-var table _checkTable = na
 
 // ── Trade Tracking Arrays ─────────────────────────────────────
 var float[] _trEntry  = array.new<float>()   // entry price
@@ -390,66 +388,72 @@ var float _lastNfpMoM = 0.0     // NOT reset daily — direction of last NFP rea
 atr14  = ta.atr(i_atrLen)
 volAvg = ta.sma(volume, i_volAvgLen)
 rvol   = volume / volAvg
-ema20  = ta.ema(close, 20)
-ema50  = ta.ema(close, 50)
-rsi14  = ta.rsi(close, 14)
+rsi14   = ta.rsi(close, 14)
 vwapVal = ta.vwap(hlc3)
 
+// ── NON-REPAINTING DATA ───────────────────────────────────────
+// Every higher-TF request uses the confirmed-bar idiom: expr[1] + lookahead_on.
+// That returns the value of the last COMPLETED higher-TF bar and is identical
+// on historical and realtime bars — live signals match the backtest exactly.
+
 // HTF data — must be at global scope
-htfClose = request.security(syminfo.tickerid, i_htfTF, close,           lookahead=barmerge.lookahead_off)
-htfEma20 = request.security(syminfo.tickerid, i_htfTF, ta.ema(close,20), lookahead=barmerge.lookahead_off)
-htfEma50 = request.security(syminfo.tickerid, i_htfTF, ta.ema(close,50), lookahead=barmerge.lookahead_off)
+htfClose = request.security(syminfo.tickerid, i_htfTF, close[1],             lookahead=barmerge.lookahead_on)
+htfEma20 = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, 20)[1], lookahead=barmerge.lookahead_on)
+htfEma50 = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
 
-// Daily data
-dailyATR = request.security(syminfo.tickerid, "D", ta.atr(10),   lookahead=barmerge.lookahead_off)
-dHigh    = request.security(syminfo.tickerid, "D", high,          lookahead=barmerge.lookahead_off)
-dLow     = request.security(syminfo.tickerid, "D", low,           lookahead=barmerge.lookahead_off)
-dOpen    = request.security(syminfo.tickerid, "D", open,          lookahead=barmerge.lookahead_off)
-pdHigh   = request.security(syminfo.tickerid, "D", high[1],       lookahead=barmerge.lookahead_off)
-pdLow    = request.security(syminfo.tickerid, "D", low[1],        lookahead=barmerge.lookahead_off)
+// Daily data — previous-day values are confirmed at day open and stable all session.
+// dOpen takes TODAY's open: it is fixed on the first bar of the day, so lookahead_on is leak-free.
+dOpen    = request.security(syminfo.tickerid, "D", open,     lookahead=barmerge.lookahead_on)
+pdHigh   = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_on)
+pdLow    = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_on)
+pdClose  = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
 
-// ── Reference TF data — signals, ATR, and confirmations all use these ────────
-// On any chart TF, a signal fires exactly once per i_refTF bar close.
-// close[1] inside request.security refers to the previous REFERENCE TF bar.
-ref_close     = request.security(syminfo.tickerid, i_refTF, close,                                    lookahead=barmerge.lookahead_off)
-ref_close1    = request.security(syminfo.tickerid, i_refTF, close[1],                                 lookahead=barmerge.lookahead_off)
-ref_high      = request.security(syminfo.tickerid, i_refTF, high,                                     lookahead=barmerge.lookahead_off)
-ref_low       = request.security(syminfo.tickerid, i_refTF, low,                                      lookahead=barmerge.lookahead_off)
-ref_atr14     = request.security(syminfo.tickerid, i_refTF, ta.atr(i_atrLen),                         lookahead=barmerge.lookahead_off)
-ref_rsi14     = request.security(syminfo.tickerid, i_refTF, ta.rsi(close, 14),                        lookahead=barmerge.lookahead_off)
-ref_vwap      = request.security(syminfo.tickerid, i_refTF, ta.vwap(hlc3),                            lookahead=barmerge.lookahead_off)
-ref_rvol      = request.security(syminfo.tickerid, i_refTF, volume / ta.sma(volume, i_volAvgLen),     lookahead=barmerge.lookahead_off)
-ref_bearBar   = request.security(syminfo.tickerid, i_refTF, close < open,                             lookahead=barmerge.lookahead_off)
-ref_bullBar   = request.security(syminfo.tickerid, i_refTF, close > open,                             lookahead=barmerge.lookahead_off)
-ref_time      = request.security(syminfo.tickerid, i_refTF, time,                                     lookahead=barmerge.lookahead_off)
-pdClose  = request.security(syminfo.tickerid, "D", close[1],      lookahead=barmerge.lookahead_off)
+// ── Reference TF routing ──────────────────────────────────────
+// request.security cannot reliably sample a LOWER timeframe than the chart, so
+// when a configured reference TF is ≤ the chart TF the chart's own bars are
+// used directly (signals then evaluate on every chart bar close). A warning is
+// shown on the chart when the chart TF is strictly higher (Section 20B).
+_refUseChart  = timeframe.in_seconds(i_refTF)      <= timeframe.in_seconds(timeframe.period)
+_fastUseChart = timeframe.in_seconds(i_refTF_fast) <= timeframe.in_seconds(timeframe.period)
 
-// New ref-TF bar detected: fires on the FIRST chart bar of each new ref-TF period.
-// At this moment ref_close = confirmed close of the bar that just completed (lookahead_off).
-// Works correctly on ALL historical bars (unlike barstate.isconfirmed which is always true historically).
+// ── Primary Reference TF data (M3/M4/M6/M7/M9, M10 Phase 1) ──────────────────
+// On the FIRST chart bar of each new ref-TF period, ref_close is the confirmed
+// close of the ref bar that just completed — on historical AND realtime bars.
+ref_close   = _refUseChart ? close        : request.security(syminfo.tickerid, i_refTF, close[1],                                  lookahead=barmerge.lookahead_on)
+ref_close1  = _refUseChart ? close[1]     : request.security(syminfo.tickerid, i_refTF, close[2],                                  lookahead=barmerge.lookahead_on)
+ref_high    = _refUseChart ? high         : request.security(syminfo.tickerid, i_refTF, high[1],                                   lookahead=barmerge.lookahead_on)
+ref_low     = _refUseChart ? low          : request.security(syminfo.tickerid, i_refTF, low[1],                                    lookahead=barmerge.lookahead_on)
+ref_atr14   = _refUseChart ? atr14        : request.security(syminfo.tickerid, i_refTF, ta.atr(i_atrLen)[1],                       lookahead=barmerge.lookahead_on)
+ref_rsi14   = _refUseChart ? rsi14        : request.security(syminfo.tickerid, i_refTF, ta.rsi(close, 14)[1],                      lookahead=barmerge.lookahead_on)
+ref_vwap    = _refUseChart ? vwapVal      : request.security(syminfo.tickerid, i_refTF, ta.vwap(hlc3)[1],                          lookahead=barmerge.lookahead_on)
+ref_rvol    = _refUseChart ? rvol         : request.security(syminfo.tickerid, i_refTF, (volume / ta.sma(volume, i_volAvgLen))[1], lookahead=barmerge.lookahead_on)
+ref_bullBar = _refUseChart ? close > open : request.security(syminfo.tickerid, i_refTF, (close > open)[1],                         lookahead=barmerge.lookahead_on)
+ref_bearBar = _refUseChart ? close < open : request.security(syminfo.tickerid, i_refTF, (close < open)[1],                         lookahead=barmerge.lookahead_on)
+ref_time    = _refUseChart ? time         : request.security(syminfo.tickerid, i_refTF, time[1],                                   lookahead=barmerge.lookahead_on)
+
+// New ref-TF bar detected: fires on the FIRST chart bar after a ref-TF bar completes.
+// When the ref TF resolves to the chart TF, ref_time is the chart bar time → edge fires every bar.
 _refEdge = ref_time != ref_time[1]
 
-// ── Fast Reference TF data (M1 Crabel + Combined mode) ───────────────────────
-// Separate request.security block on i_refTF_fast (default "1").
-// RSI included for f_modelScore (M1 uses fast TF for scoring).
-fast_close     = request.security(syminfo.tickerid, i_refTF_fast, close,                                lookahead=barmerge.lookahead_off)
-fast_close1    = request.security(syminfo.tickerid, i_refTF_fast, close[1],                             lookahead=barmerge.lookahead_off)
-fast_high      = request.security(syminfo.tickerid, i_refTF_fast, high,                                 lookahead=barmerge.lookahead_off)
-fast_low       = request.security(syminfo.tickerid, i_refTF_fast, low,                                  lookahead=barmerge.lookahead_off)
-fast_atr14     = request.security(syminfo.tickerid, i_refTF_fast, ta.atr(i_atrLen),                     lookahead=barmerge.lookahead_off)
-fast_vwap      = request.security(syminfo.tickerid, i_refTF_fast, ta.vwap(hlc3),                        lookahead=barmerge.lookahead_off)
-fast_rvol      = request.security(syminfo.tickerid, i_refTF_fast, volume / ta.sma(volume, i_volAvgLen), lookahead=barmerge.lookahead_off)
-fast_rsi14     = request.security(syminfo.tickerid, i_refTF_fast, ta.rsi(close, 14),                    lookahead=barmerge.lookahead_off)
-fast_bullBar   = request.security(syminfo.tickerid, i_refTF_fast, close > open,                         lookahead=barmerge.lookahead_off)
-fast_bearBar   = request.security(syminfo.tickerid, i_refTF_fast, close < open,                         lookahead=barmerge.lookahead_off)
-fast_time      = request.security(syminfo.tickerid, i_refTF_fast, time,                                 lookahead=barmerge.lookahead_off)
+// ── Fast Reference TF data (M1 Crabel, Combined mode, M10 Phase 2/3) ──────────
+fast_close   = _fastUseChart ? close        : request.security(syminfo.tickerid, i_refTF_fast, close[1],                                  lookahead=barmerge.lookahead_on)
+fast_close1  = _fastUseChart ? close[1]     : request.security(syminfo.tickerid, i_refTF_fast, close[2],                                  lookahead=barmerge.lookahead_on)
+fast_high    = _fastUseChart ? high         : request.security(syminfo.tickerid, i_refTF_fast, high[1],                                   lookahead=barmerge.lookahead_on)
+fast_low     = _fastUseChart ? low          : request.security(syminfo.tickerid, i_refTF_fast, low[1],                                    lookahead=barmerge.lookahead_on)
+fast_atr14   = _fastUseChart ? atr14        : request.security(syminfo.tickerid, i_refTF_fast, ta.atr(i_atrLen)[1],                       lookahead=barmerge.lookahead_on)
+fast_vwap    = _fastUseChart ? vwapVal      : request.security(syminfo.tickerid, i_refTF_fast, ta.vwap(hlc3)[1],                          lookahead=barmerge.lookahead_on)
+fast_rvol    = _fastUseChart ? rvol         : request.security(syminfo.tickerid, i_refTF_fast, (volume / ta.sma(volume, i_volAvgLen))[1], lookahead=barmerge.lookahead_on)
+fast_rsi14   = _fastUseChart ? rsi14        : request.security(syminfo.tickerid, i_refTF_fast, ta.rsi(close, 14)[1],                      lookahead=barmerge.lookahead_on)
+fast_bullBar = _fastUseChart ? close > open : request.security(syminfo.tickerid, i_refTF_fast, (close > open)[1],                         lookahead=barmerge.lookahead_on)
+fast_bearBar = _fastUseChart ? close < open : request.security(syminfo.tickerid, i_refTF_fast, (close < open)[1],                         lookahead=barmerge.lookahead_on)
+fast_time    = _fastUseChart ? time         : request.security(syminfo.tickerid, i_refTF_fast, time[1],                                   lookahead=barmerge.lookahead_on)
 
 _fastEdge = fast_time != fast_time[1]
 
-// ── DXY data — inverse correlation scoring ───────────────────
-dxy_close = request.security(i_dxy_sym, i_dxy_tf, close,             lookahead=barmerge.lookahead_off)
-dxy_ema20 = request.security(i_dxy_sym, i_dxy_tf, ta.ema(close, 20), lookahead=barmerge.lookahead_off)
-dxy_ema50 = request.security(i_dxy_sym, i_dxy_tf, ta.ema(close, 50), lookahead=barmerge.lookahead_off)
+// ── DXY data — inverse correlation scoring (confirmed bars) ──
+dxy_close = request.security(i_dxy_sym, i_dxy_tf, close[1],             lookahead=barmerge.lookahead_on)
+dxy_ema20 = request.security(i_dxy_sym, i_dxy_tf, ta.ema(close, 20)[1], lookahead=barmerge.lookahead_on)
+dxy_ema50 = request.security(i_dxy_sym, i_dxy_tf, ta.ema(close, 50)[1], lookahead=barmerge.lookahead_on)
 
 // ── Economic indicators — CPI & NFP for Gold market context ──
 // Always run (Pine v6 requirement); i_news_on + _isGoldChart gate display only.
@@ -517,10 +521,11 @@ if _newDay
     _pdLow   := pdLow
     _pdClose := pdClose
 
-    // Rolling 7-day ranges for NR7
-    todayRange = dHigh - dLow
-    if not na(todayRange) and todayRange > 0
-        array.push(_dailyRanges, todayRange)
+    // Rolling ranges of COMPLETED days for NR7/NR4 — push yesterday's confirmed range.
+    // Never uses today's developing range, so NR status is stable all session (no repaint).
+    prevDayRange = pdHigh - pdLow
+    if not na(prevDayRange) and prevDayRange > 0
+        array.push(_dailyRanges, prevDayRange)
         if array.size(_dailyRanges) > 7
             array.shift(_dailyRanges)
 
@@ -546,7 +551,6 @@ if _newDay
     // Reset model state
     _m9BullBreak  := false
     _m9BearBreak  := false
-    _m9BreakBar   := 0
     _m9InsideCount := 0
     _m9FiredBull  := false
     _m9FiredBear  := false
@@ -663,33 +667,29 @@ if _or15Complete and not _fvgTriggered and inNYSession
 // SECTION 9 — NR7 / NR4 DETECTION (functions)
 // ============================================================
 
-// NR7: today's range narrowest of last 7 days
-f_isNR7() =>
+// NR7/NR4: the most recent COMPLETED day's range is the narrowest of the last
+// N completed days (classic Crabel: trade the day AFTER the narrow-range day).
+// Uses confirmed previous-day data only — stable for the whole session,
+// identical on historical and realtime bars.
+f_isNRn(n) =>
     sz = array.size(_dailyRanges)
     if sz < 2
         false
     else
-        todayR = dHigh - dLow
+        lastR  = array.get(_dailyRanges, sz - 1)
         result = true
-        for i = 0 to math.min(sz, 7) - 1
-            if todayR > array.get(_dailyRanges, sz - 1 - i)
+        for i = 1 to math.min(sz, n) - 1
+            if lastR > array.get(_dailyRanges, sz - 1 - i)
                 result := false
         result
 
-f_isNR4() =>
-    sz = array.size(_dailyRanges)
-    if sz < 2
-        false
-    else
-        todayR = dHigh - dLow
-        result = true
-        for i = 0 to math.min(sz, 4) - 1
-            if todayR > array.get(_dailyRanges, sz - 1 - i)
-                result := false
-        result
+isNR7 = f_isNRn(7)
+isNR4 = f_isNRn(4)
 
-isNR7 = f_isNR7()
-isNR4 = f_isNR4()
+// Volume gate — na-safe: passes when the filter is disabled (mult ≤ 0) or when
+// the symbol's feed has no usable volume (rvol = na must not block all signals)
+f_volOK(_rvol, _minMult) =>
+    _minMult <= 0 or na(_rvol) or _rvol >= _minMult
 
 // ============================================================
 // SECTION 10 — DRAWING HELPERS (functions)
@@ -810,7 +810,7 @@ if _or15Complete and not na(_orHLineActive)
 // _rc=close, _rvol=rel-volume, _rvwap=vwap, _rsi=RSI14 — all from model's own TF.
 f_modelScore(isBull, _rc, _rvol, _rvwap, _rsi) =>
     vwapPts  = (isBull ? _rc > _rvwap : _rc < _rvwap) ? 25 : 0
-    volPts   = _rvol >= 2.0 ? 25 : _rvol >= 1.5 ? 18 : _rvol >= 1.2 ? 10 : 0
+    volPts   = na(_rvol) ? 10 : _rvol >= 2.0 ? 25 : _rvol >= 1.5 ? 18 : _rvol >= 1.2 ? 10 : 0
     htfPts   = isBull ? (htfEma20 > htfEma50 ? 20 : 0) : (htfEma20 < htfEma50 ? 20 : 0)
     rsiPts   = isBull ? (_rsi >= 45 and _rsi <= 70 ? 15 : 0)
                       : (_rsi >= 30 and _rsi <= 55 ? 15 : 0)
@@ -825,18 +825,18 @@ f_modelScore(isBull, _rc, _rvol, _rvwap, _rsi) =>
 
 // ── Model 1: Classic Crabel ───────────────────────────────────
 // Uses fast TF data (_rc/_rc1/_ratr/_edge) — defaults 1m per CSV backtest (60–67% WR)
-f_model1(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol) =>
+f_model1(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _gateBull, _gateBear) =>
     bull = false
     bear = false
     if _orCrabelComplete and not na(_orCrabelH) and not na(_orCrabelL) and _orCrabelWidthOK
         if _edge and not pastCutoff and inNYSession
             nrPass = i_m1_nr7 ? (isNR7 or isNR4) : true
-            volOk  = i_m1_volMult <= 0 or _rvol >= i_m1_volMult
+            volOk  = f_volOK(_rvol, i_m1_volMult)
             if nrPass and volOk
                 slDist = _ratr * i_atrMult
                 // Bull breakout: entryP = OR breakout level (buy-stop price, TF-consistent).
                 // close > _orCrabelH confirms breakout; SL/TP are anchored to the OR level.
-                if _rc > _orCrabelH and _rc1 <= _orCrabelH and not _firedBull
+                if _rc > _orCrabelH and _rc1 <= _orCrabelH and not _firedBull and _gateBull
                     bull   := true
                     entryP  = _orCrabelH
                     slP     = entryP - slDist
@@ -845,7 +845,7 @@ f_model1(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol) =>
                     f_drawLabel("M1 Crabel", entryP, slP, tpP, true, 0.6, f_modelScore(true,  _rc, _rvol, fast_vwap, fast_rsi14))
                     f_registerTrade(1, entryP, slP, tpP, true)
                 // Bear breakdown
-                if _rc < _orCrabelL and _rc1 >= _orCrabelL and not _firedBear
+                if _rc < _orCrabelL and _rc1 >= _orCrabelL and not _firedBear and _gateBear
                     bear   := true
                     entryP  = _orCrabelL
                     slP     = entryP + slDist
@@ -857,14 +857,14 @@ f_model1(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol) =>
 
 // ── Model 3: 5-Min Scalper ────────────────────────────────────
 // Uses primary TF data — defaults 5m per CSV backtest (71–85% WR)
-f_model3(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap) =>
+f_model3(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap, _gateBull, _gateBear) =>
     bull = false
     bear = false
     if _or5Complete and not na(_or5H) and not na(_or5L) and _or5WidthOK
         if _edge and not pastCutoff and inNYSession
-            volOk  = _rvol >= i_m3_volMult
+            volOk  = f_volOK(_rvol, i_m3_volMult)
             slDist = _ratr * i_atrMult
-            if _rc > _or5H and _rc1 <= _or5H and volOk and _rc > _rvwap and not _firedBull
+            if _rc > _or5H and _rc1 <= _or5H and volOk and _rc > _rvwap and not _firedBull and _gateBull
                 bull   := true
                 entryP  = _or5H
                 slP     = entryP - slDist
@@ -872,7 +872,7 @@ f_model3(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap) =>
                 f_drawSLTP(entryP, slP, tpP, i_colBull, i_colSL, i_colTP)
                 f_drawLabel("M3 5min", entryP, slP, tpP, true, 2.2, f_modelScore(true,  _rc, _rvol, _rvwap, ref_rsi14))
                 f_registerTrade(3, entryP, slP, tpP, true)
-            if _rc < _or5L and _rc1 >= _or5L and volOk and _rc < _rvwap and not _firedBear
+            if _rc < _or5L and _rc1 >= _or5L and volOk and _rc < _rvwap and not _firedBear and _gateBear
                 bear   := true
                 entryP  = _or5L
                 slP     = entryP + slDist
@@ -884,16 +884,16 @@ f_model3(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap) =>
 
 // ── Model 4: Standard 15-Min ──────────────────────────────────
 // Uses primary TF data — RSI also from primary TF
-f_model4(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap, _rrsi) =>
+f_model4(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap, _rrsi, _gateBull, _gateBear) =>
     bull = false
     bear = false
     if _or15Complete and not na(_or15H) and not na(_or15L) and _or15WidthOK
         if _edge and not pastCutoff and inNYSession
-            volOk   = _rvol >= i_m4_volMult
+            volOk   = f_volOK(_rvol, i_m4_volMult)
             htfBull = htfClose > htfEma20 and htfEma20 > htfEma50
             htfBear = htfClose < htfEma20 and htfEma20 < htfEma50
             slDist  = _ratr * i_atrMult
-            if _rc > _or15H and _rc1 <= _or15H and not _firedBull
+            if _rc > _or15H and _rc1 <= _or15H and not _firedBull and _gateBull
                 if volOk and _rc > _rvwap and _rrsi >= i_m4_rsiMin and _rrsi <= 70 and htfBull
                     bull   := true
                     entryP  = _or15H
@@ -902,7 +902,7 @@ f_model4(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap, _rrsi) 
                     f_drawSLTP(entryP, slP, tpP, i_colBull, i_colSL, i_colTP)
                     f_drawLabel("M4 15min", entryP, slP, tpP, true, 3.0, f_modelScore(true,  _rc, _rvol, _rvwap, _rrsi))
                     f_registerTrade(4, entryP, slP, tpP, true)
-            if _rc < _or15L and _rc1 >= _or15L and not _firedBear
+            if _rc < _or15L and _rc1 >= _or15L and not _firedBear and _gateBear
                 if volOk and _rc < _rvwap and _rrsi <= i_m4_rsiMax and _rrsi >= 30 and htfBear
                     bear   := true
                     entryP  = _or15L
@@ -915,15 +915,15 @@ f_model4(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap, _rrsi) 
 
 // ── Model 7: Gold ORB ─────────────────────────────────────────
 // Uses primary TF data — 5m per CSV backtest (46–48% WR; marginal but included)
-f_model7(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap) =>
+f_model7(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap, _gateBull, _gateBear) =>
     bull = false
     bear = false
     if _or15Complete and not na(_or15H) and not na(_or15L) and _or15WidthOK
         if _edge and nyHour < i_m7_cutoffHour and inNYSession
             slDist = _ratr * i_atrMult
-            volOk  = i_m7_volMult <= 0 or _rvol >= i_m7_volMult
+            volOk  = f_volOK(_rvol, i_m7_volMult)
             orMid7  = (_or15H + _or15L) / 2
-            if _rc > _or15H and _rc1 <= _or15H and not _firedBull and volOk and _rc > _rvwap
+            if _rc > _or15H and _rc1 <= _or15H and not _firedBull and volOk and _rc > _rvwap and _gateBull
                 bull   := true
                 entryP  = _rc                      // confirmed close above OR high
                 slP     = orMid7 - slDist          // SL below OR mid + ATR buffer
@@ -932,7 +932,7 @@ f_model7(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap) =>
                 f_drawSLTP(entryP, slP, tpP, i_colBull, i_colSL, i_colTP)
                 f_drawLabel("M7 Gold", entryP, slP, tpP, true, 2.2, f_modelScore(true,  _rc, _rvol, _rvwap, ref_rsi14))
                 f_registerTrade(7, entryP, slP, tpP, true)
-            if _rc < _or15L and _rc1 >= _or15L and not _firedBear and volOk and _rc < _rvwap
+            if _rc < _or15L and _rc1 >= _or15L and not _firedBear and volOk and _rc < _rvwap and _gateBear
                 bear   := true
                 entryP  = _rc                      // confirmed close below OR low
                 slP     = orMid7 + slDist          // SL above OR mid + ATR buffer
@@ -947,49 +947,51 @@ f_model7(_firedBull, _firedBear, _rc, _rc1, _ratr, _edge, _rvol, _rvwap) =>
 // SECTION 13 — RUN STATELESS MODELS (Multi-Model mode)
 // ============================================================
 
+// DXY gates are passed INTO the models so a suppressed signal never registers
+// a trade, draws SL/TP, or touches the dashboard — gate and visuals stay in sync.
 if true
     if i_m1_on
         // M1 uses fast TF (default 1m) — best per CSV backtest
-        [b, s] = f_model1(_m1FiredBull, _m1FiredBear, fast_close, fast_close1, fast_atr14, _fastEdge, fast_rvol)
-        sig_m1_bull := b and _dxyBullGate
-        sig_m1_bear := s and _dxyBearGate
-        if b and _dxyBullGate
+        [b, s] = f_model1(_m1FiredBull, _m1FiredBear, fast_close, fast_close1, fast_atr14, _fastEdge, fast_rvol, _dxyBullGate, _dxyBearGate)
+        sig_m1_bull := b
+        sig_m1_bear := s
+        if b
             _m1FiredBull    := true
             _agreeCountBull += 1
-        if s and _dxyBearGate
+        if s
             _m1FiredBear    := true
             _agreeCountBear += 1
     if i_m3_on
         // M3 uses primary TF (default 5m) — best per CSV backtest
-        [b, s] = f_model3(_m3FiredBull, _m3FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap)
-        sig_m3_bull := b and _dxyBullGate
-        sig_m3_bear := s and _dxyBearGate
-        if b and _dxyBullGate
+        [b, s] = f_model3(_m3FiredBull, _m3FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, _dxyBullGate, _dxyBearGate)
+        sig_m3_bull := b
+        sig_m3_bear := s
+        if b
             _m3FiredBull    := true
             _agreeCountBull += 1
-        if s and _dxyBearGate
+        if s
             _m3FiredBear    := true
             _agreeCountBear += 1
     if i_m4_on
         // M4 uses primary TF (default 5m)
-        [b, s] = f_model4(_m4FiredBull, _m4FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, ref_rsi14)
-        sig_m4_bull := b and _dxyBullGate
-        sig_m4_bear := s and _dxyBearGate
-        if b and _dxyBullGate
+        [b, s] = f_model4(_m4FiredBull, _m4FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, ref_rsi14, _dxyBullGate, _dxyBearGate)
+        sig_m4_bull := b
+        sig_m4_bear := s
+        if b
             _m4FiredBull    := true
             _agreeCountBull += 1
-        if s and _dxyBearGate
+        if s
             _m4FiredBear    := true
             _agreeCountBear += 1
     if i_m7_on
         // M7 uses primary TF (default 5m)
-        [b, s] = f_model7(_m7FiredBull, _m7FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap)
-        sig_m7_bull := b and _dxyBullGate
-        sig_m7_bear := s and _dxyBearGate
-        if b and _dxyBullGate
+        [b, s] = f_model7(_m7FiredBull, _m7FiredBear, ref_close, ref_close1, ref_atr14, _refEdge, ref_rvol, ref_vwap, _dxyBullGate, _dxyBearGate)
+        sig_m7_bull := b
+        sig_m7_bear := s
+        if b
             _m7FiredBull    := true
             _agreeCountBull += 1
-        if s and _dxyBearGate
+        if s
             _m7FiredBear    := true
             _agreeCountBear += 1
 
@@ -1051,18 +1053,21 @@ if i_m9_on and _or15Complete and not na(_or15H) and not na(_or15L) and _or15Widt
         if not _m9BullBreak and not _m9BearBreak
             if ref_close > _or15H
                 _m9BullBreak   := true
-                _m9BreakBar    := bar_index
                 _m9InsideCount := 0
             else if ref_close < _or15L
                 _m9BearBreak   := true
-                _m9BreakBar    := bar_index
                 _m9InsideCount := 0
 
         // Track bars returning inside OR after bull breakout
         if _m9BullBreak and not _m9BearBreak
-            if ref_close <= _or15H and ref_close >= _or15L
+            if ref_close < _or15L
+                // Full reversal through the opposite boundary — re-arm as a bear breakout
+                _m9BullBreak   := false
+                _m9BearBreak   := true
+                _m9InsideCount := 0
+            else if ref_close <= _or15H
                 _m9InsideCount += 1
-            else if ref_close > _or15H
+            else
                 _m9InsideCount := 0  // still outside, reset counter
             // Enough bars back inside → bull failed → short at market (close)
             if _m9InsideCount >= i_m9_failBars and not pastCutoff
@@ -1082,9 +1087,14 @@ if i_m9_on and _or15Complete and not na(_or15H) and not na(_or15L) and _or15Widt
 
         // Track bars returning inside OR after bear breakout
         if _m9BearBreak and not _m9BullBreak
-            if ref_close >= _or15L and ref_close <= _or15H
+            if ref_close > _or15H
+                // Full reversal through the opposite boundary — re-arm as a bull breakout
+                _m9BearBreak   := false
+                _m9BullBreak   := true
+                _m9InsideCount := 0
+            else if ref_close >= _or15L
                 _m9InsideCount += 1
-            else if ref_close < _or15L
+            else
                 _m9InsideCount := 0
             // Enough bars back inside → bear failed → long at market (close)
             if _m9InsideCount >= i_m9_failBars and not pastCutoff
@@ -1112,7 +1122,7 @@ if i_m10_on and _or15Complete and _or15WidthOK
     // ── PHASE 1: 5-min breakout confirmation ───────────────────
     // Gate: _refEdge ensures we only fire on a new 5-min bar close
     if _refEdge and not pastCutoff
-        _bdmVolOk = i_m7_volMult <= 0 or ref_rvol >= i_m7_volMult   // reuse M7 vol threshold (shared param)
+        _bdmVolOk = f_volOK(ref_rvol, i_m7_volMult)   // reuse M7 vol threshold (shared param)
         // Bull: 5-min close crosses above OR high — require VWAP + volume
         if ref_close > _or15H and ref_close1 <= _or15H and not _bdmFiredBull and not _bdmBullBreak
              and _bdmVolOk and ref_close > ref_vwap
@@ -1386,7 +1396,7 @@ _dayBias   := _biasScore >= 35 ? "BULLISH" : _biasScore <= -35 ? "BEARISH" : "NE
 // All scoring functions are pure (read-only global access)
 
 f_scoreVolume(_rvol) =>
-    _rvol >= 2.0 ? 100.0 : _rvol >= 1.5 ? 80.0 : _rvol >= 1.2 ? 60.0 : 20.0
+    na(_rvol) ? 50.0 : _rvol >= 2.0 ? 100.0 : _rvol >= 1.5 ? 80.0 : _rvol >= 1.2 ? 60.0 : 20.0
 
 f_scoreHTF(isBull) =>
     if isBull
@@ -1736,59 +1746,6 @@ if i_showDashboard
         table.cell(_dashTable, 8, _br, orLStr,                                  text_color=C_TXT_DIM,  bgcolor=GOLD_BG, text_size=_dashSz)
         table.cell(_dashTable, 9, _br, _bScoreStr,                              text_color=_bScoreClr, bgcolor=GOLD_BG, text_size=_dashSz)
 
-// ── Combined Mode Checklist — disabled (Combined now runs inside Multi-Model) ──
-if false and i_showDashboard and i_comb_on
-    if na(_checkTable)
-        _checkTable := table.new(f_tablePos(i_dashPos), 4, 11,
-             bgcolor       = color.new(#1A1D26, 10),
-             border_color  = color.new(color.gray, 50),
-             border_width  = 1,
-             frame_color   = color.new(color.gray, 30),
-             frame_width   = 1)
-
-    // Header
-    table.cell(_checkTable, 0, 0, "FACTOR",  text_color=C_TXT, bgcolor=C_HEAD, text_size=_headSz)
-    table.cell(_checkTable, 1, 0, "SCORE",   text_color=C_TXT, bgcolor=C_HEAD, text_size=_headSz)
-    table.cell(_checkTable, 2, 0, "WEIGHT",  text_color=C_TXT, bgcolor=C_HEAD, text_size=_headSz)
-    table.cell(_checkTable, 3, 0, "STATUS",  text_color=C_TXT, bgcolor=C_HEAD, text_size=_headSz)
-
-    // Direction for scoring context
-    isBullCtx = _confBull
-
-    sVol  = f_scoreVolume(fast_rvol)
-    sHTF  = f_scoreHTF(isBullCtx)
-    sDay  = f_scoreDayType()
-    sNR   = f_scoreNR()
-    sATR  = f_scoreATR()
-    sCls  = f_scoreCloseQuality(isBullCtx, fast_close, fast_atr14)
-    sVWAP = f_scoreVWAP(isBullCtx, fast_close, fast_vwap)
-    sFlow = f_scoreOrderFlow(isBullCtx, fast_high, fast_low, fast_close, fast_bullBar, fast_bearBar)
-
-    fNames  = array.from("Volume","HTF Trend","Day Type","NR7/NR4","ATR Width","Close Qual","VWAP","OrderFlow")
-    fScores = array.from(sVol, sHTF, sDay, sNR, sATR, sCls, sVWAP, sFlow)
-    fWeights= array.from(i_wVol, i_wHTF, i_wDay, i_wNR, i_wATR, i_wClose, i_wVWAP, i_wFlow)
-
-    for i = 0 to 7
-        sc     = array.get(fScores,  i)
-        wt     = array.get(fWeights, i)
-        fn     = array.get(fNames,   i)
-        stStr  = sc >= 70 ? "✓ PASS" : sc >= 40 ? "~ PART" : "✗ FAIL"
-        stClr  = sc >= 70 ? color.new(#00E676,0) : sc >= 40 ? color.new(#FF9800,0) : color.new(#FF1744,0)
-        table.cell(_checkTable, 0, i+1, fn,                            text_color=C_TXT,    bgcolor=C_NONE, text_size=_dashSz)
-        table.cell(_checkTable, 1, i+1, str.tostring(math.round(sc)),  text_color=C_TXT,    bgcolor=C_NONE, text_size=_dashSz)
-        table.cell(_checkTable, 2, i+1, str.tostring(wt) + "%",        text_color=C_TXT_DIM,bgcolor=C_NONE, text_size=_dashSz)
-        table.cell(_checkTable, 3, i+1, stStr,                         text_color=stClr,    bgcolor=C_NONE, text_size=_dashSz)
-
-    // Summary row
-    totalSc  = f_confidence(isBullCtx, fast_close, fast_atr14, fast_rvol, fast_vwap, fast_high, fast_low, fast_bullBar, fast_bearBar, dxy_close, dxy_ema20, dxy_ema50)
-    gradeStr = f_grade(totalSc)
-    gradeClr = totalSc >= 80 ? color.new(#00E676,0) : totalSc >= 60 ? color.new(#FF9800,0) : color.new(#FF1744,0)
-    armedStr = totalSc >= float(i_minScore) ? "ARMED" : "BELOW MIN"
-    table.cell(_checkTable, 0, 9, "TOTAL SCORE",                          text_color=C_TXT,   bgcolor=C_HEAD, text_size=_headSz)
-    table.cell(_checkTable, 1, 9, str.tostring(math.round(totalSc)) + "%",text_color=gradeClr,bgcolor=C_HEAD, text_size=_headSz)
-    table.cell(_checkTable, 2, 9, "Grade: " + gradeStr,                   text_color=gradeClr,bgcolor=C_HEAD, text_size=_headSz)
-    table.cell(_checkTable, 3, 9, armedStr,                               text_color=gradeClr,bgcolor=C_HEAD, text_size=_headSz)
-
 // ── RVOL display row (row 8) ─────────────────────────────────
 if i_showDashboard and not na(_dashTable)
     rvolStr = str.tostring(math.round(ref_rvol * 100) / 100.0)
@@ -2011,6 +1968,25 @@ while array.size(_labels) > 490
     label.delete(array.shift(_labels))
 
 // ============================================================
+// SECTION 20B — TIMEFRAME GUARD
+// Pine cannot sample a LOWER timeframe than the chart, so when the chart TF is
+// higher than a configured reference TF, signals fall back to chart-bar closes
+// (Section 4 routing). Surface that clearly instead of failing silently.
+// ============================================================
+
+var table _warnTable = na
+_tfTooHigh = timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(i_refTF) or timeframe.in_seconds(timeframe.period) > timeframe.in_seconds(i_refTF_fast)
+if _tfTooHigh
+    if na(_warnTable)
+        _warnTable := table.new(position.top_center, 1, 1,
+             bgcolor      = color.new(#B71C1C, 10),
+             border_color = color.new(#FF8A80, 0),
+             border_width = 1)
+    table.cell(_warnTable, 0, 0,
+         "⚠ Chart TF is HIGHER than a Reference TF (" + i_refTF + " / " + i_refTF_fast + " min) — signals fall back to chart-bar closes.\nFor intended behavior use a chart TF at or below the Fast Reference TF.",
+         text_color=color.white, text_size=size.small)
+
+// ============================================================
 // SECTION 21 — plotshape (MUST be at global scope, Pine v6)
 // ============================================================
 
@@ -2121,9 +2097,9 @@ if _refEdge or _fastEdge
     _ep     = str.tostring(close, format.mintick)
 
     if sig_m1_bull
-        alert("ORB M1 Crabel LONG | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(true,  fast_close, fast_rvol, ref_vwap, ref_rsi14)) + _agBull, alert.freq_once_per_bar_close)
+        alert("ORB M1 Crabel LONG | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(true,  fast_close, fast_rvol, fast_vwap, fast_rsi14)) + _agBull, alert.freq_once_per_bar_close)
     if sig_m1_bear
-        alert("ORB M1 Crabel SHORT | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(false, fast_close, fast_rvol, ref_vwap, ref_rsi14)) + _agBear, alert.freq_once_per_bar_close)
+        alert("ORB M1 Crabel SHORT | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(false, fast_close, fast_rvol, fast_vwap, fast_rsi14)) + _agBear, alert.freq_once_per_bar_close)
     if sig_m3_bull
         alert("ORB M3 5min Scalper LONG | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(true,  ref_close, ref_rvol, ref_vwap, ref_rsi14)) + _agBull, alert.freq_once_per_bar_close)
     if sig_m3_bear
@@ -2145,9 +2121,9 @@ if _refEdge or _fastEdge
     if sig_m9_bear
         alert("ORB M9 FailORB Reversal SHORT | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(false, ref_close, ref_rvol, ref_vwap, ref_rsi14)), alert.freq_once_per_bar_close)
     if sig_m10_bull
-        alert("ORB M10 BDM LONG | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(true,  ref_close, ref_rvol, ref_vwap, ref_rsi14)) + _agBull, alert.freq_once_per_bar_close)
+        alert("ORB M10 BDM LONG | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(true,  fast_close, fast_rvol, fast_vwap, ref_rsi14)) + _agBull, alert.freq_once_per_bar_close)
     if sig_m10_bear
-        alert("ORB M10 BDM SHORT | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(false, ref_close, ref_rvol, ref_vwap, ref_rsi14)) + _agBear, alert.freq_once_per_bar_close)
+        alert("ORB M10 BDM SHORT | " + _tkr + " | Entry: " + _ep + " | score:" + str.tostring(f_modelScore(false, fast_close, fast_rvol, fast_vwap, ref_rsi14)) + _agBear, alert.freq_once_per_bar_close)
     _dxyAlertSuffix = not _dxyActive ? "" :
          na(dxy_close) or na(dxy_ema20) ? " | DXY: N/A" :
          dxy_close < dxy_ema20          ? " | DXY: BEAR (Gold+)" : " | DXY: BULL (Gold-)"
