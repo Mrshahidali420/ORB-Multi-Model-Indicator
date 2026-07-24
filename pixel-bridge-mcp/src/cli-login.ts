@@ -19,7 +19,7 @@ async function main(): Promise<void> {
     console.error(`Usage: npm run login -- <${providerNames().join("|")}>`);
     process.exit(1);
   }
-  if (config.headless) {
+  if (config.headless && !config.cdpUrl) {
     console.error("PIXEL_BRIDGE_HEADLESS is set — unset it so you can see the login window.");
     process.exit(1);
   }

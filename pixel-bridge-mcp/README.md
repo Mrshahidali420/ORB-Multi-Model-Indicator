@@ -22,6 +22,8 @@ Key principles:
 
 ## Setup (on your machine)
 
+### Option A — Managed browser (default)
+
 ```bash
 cd pixel-bridge-mcp
 npm install
@@ -32,6 +34,35 @@ npm run build
 npm run login -- chatgpt
 npm run login -- gemini
 ```
+
+Tip: set `PIXEL_BRIDGE_BROWSER_CHANNEL=chrome` to use your installed Google Chrome instead of the bundled Chromium.
+
+### Option B — Attach to your own browser (use your existing logins)
+
+Instead of letting Pixel Bridge launch its own browser, you can attach it to a real Chrome/Edge/Brave **you** started, and it will use whatever logins that browser already has. Start your browser with a debugging port and a dedicated profile folder:
+
+```bash
+# Windows (PowerShell)
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+  --remote-debugging-port=9222 --user-data-dir="$env:LOCALAPPDATA\pixel-bridge-chrome"
+
+# macOS
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 --user-data-dir="$HOME/pixel-bridge-chrome"
+
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/pixel-bridge-chrome"
+```
+
+Log into chatgpt.com / gemini.google.com in that window (once — the profile persists), then run the MCP with:
+
+```
+PIXEL_BRIDGE_CDP_URL=http://127.0.0.1:9222
+```
+
+Pixel Bridge opens **its own tabs** in that browser, never touches your tabs, and on shutdown closes only its tabs and disconnects — your browser keeps running. You can watch every generation live and handle any login challenge in the same window.
+
+> **Why not my normal day-to-day Chrome profile?** Chrome itself refuses remote debugging on the default profile (a security measure since Chrome 136 that protects your cookies from debugger-based theft), and a running Chrome locks its profile. That's why attach mode needs a dedicated `--user-data-dir` — you still sign in only once there, and it stays signed in like your normal browser. Pixel Bridge does not attempt to bypass this protection.
 
 Register with Claude Code — add to your project's `.mcp.json` (or `claude mcp add`):
 
@@ -122,6 +153,7 @@ Reliability decisions:
 | `PIXEL_BRIDGE_HEADLESS` | `false` | Headed is the default — friendlier to consumer sites and required for manual login |
 | `PIXEL_BRIDGE_BROWSER_CHANNEL` | – | e.g. `chrome` to use your installed Chrome instead of bundled Chromium |
 | `PIXEL_BRIDGE_EXECUTABLE_PATH` | – | Explicit browser binary path |
+| `PIXEL_BRIDGE_CDP_URL` | – | Attach mode: connect to your own running browser (e.g. `http://127.0.0.1:9222`) instead of launching one |
 | `PIXEL_BRIDGE_GENERATION_TIMEOUT_S` | `300` | Hard ceiling per generation |
 | `PIXEL_BRIDGE_DEFAULT_WAIT_S` | `150` | Default inline wait before returning a job id |
 | `PIXEL_BRIDGE_LOGIN_TIMEOUT_S` | `300` | Manual-login wait |

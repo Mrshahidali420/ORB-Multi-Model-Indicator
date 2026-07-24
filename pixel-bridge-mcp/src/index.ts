@@ -340,7 +340,7 @@ server.registerTool(
   },
   async (args) => {
     try {
-      if (config.headless) {
+      if (config.headless && !config.cdpUrl) {
         return jsonResult(
           {
             error:
